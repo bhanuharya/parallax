@@ -12,6 +12,9 @@ black surfaces, muted neon-green accent, mono data). It is **multi-tenant by org
 register any workspace (e.g. a domain you are authorized to assess), scan it, and
 visualize its findings — no hardcoding to one company.
 
+> **Onboarding an agent or engineer?** Read [HANDOFF.md](HANDOFF.md) — current
+> cycle state, the scanner traps that will bite you, and the open backlog.
+
 > **Intended use:** authorized security teams assessing **their own** external
 > footprint. Scanning is **passive / non-intrusive by default** (certificate
 > transparency — crt.name / crt.sh / certspotter / hackertarget — plus DNS

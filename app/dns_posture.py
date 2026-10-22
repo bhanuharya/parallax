@@ -562,7 +562,7 @@ def _resolver():
     return _RESOLVER or None
 
 
-def _query(name, rtype, want="records"):
+def _query(name, rtype):
     """One bounded DNS query. Returns a list of strings, [] for NoAnswer /
     NXDOMAIN, or None when the lookup could not be performed (so 'unknown' is
     distinguishable from 'absent' — the difference matters for findings)."""
