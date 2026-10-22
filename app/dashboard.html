@@ -105,6 +105,43 @@
   .invtag.warn { color:var(--yellow); border-color:var(--yellow); }
   .invtag.good { color:var(--green); border-color:var(--green); }
   .invempty { color:var(--dim); font-family:var(--mono); font-size:12px; padding:10px 2px; }
+  /* security scorecard */
+  .scgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr));
+            gap:12px; padding:4px 0 6px; }
+  .sccard { background:var(--panel2); border:1px solid var(--border); border-radius:10px;
+            padding:12px 14px; }
+  .sccard.grade-A { border-left:3px solid var(--green); }
+  .sccard.grade-B { border-left:3px solid #8ecf5a; }
+  .sccard.grade-C { border-left:3px solid var(--yellow); }
+  .sccard.grade-D { border-left:3px solid #ff9f43; }
+  .sccard.grade-F { border-left:3px solid var(--red); }
+  .sccard.grade-\? { border-left:3px solid var(--dim); }
+  .schead { display:flex; align-items:baseline; gap:10px; margin-bottom:8px; }
+  .scgrade { font-family:var(--mono); font-size:26px; font-weight:700; line-height:1; }
+  .grade-A .scgrade { color:var(--green); }
+  .grade-B .scgrade { color:#8ecf5a; }
+  .grade-C .scgrade { color:var(--yellow); }
+  .grade-D .scgrade { color:#ff9f43; }
+  .grade-F .scgrade { color:var(--red); }
+  .grade-\? .scgrade { color:var(--dim); }
+  .scscore { font-family:var(--mono); font-size:13px; color:var(--dim); }
+  .scdomain { font-family:var(--mono); font-size:12px; color:var(--txt);
+              margin-left:auto; text-align:right; word-break:break-all; }
+  .scbar { height:5px; background:var(--border); border-radius:3px; overflow:hidden;
+           margin-bottom:9px; }
+  .scbar > i { display:block; height:100%; background:var(--green); }
+  .scbar.warn > i { background:var(--yellow); }
+  .scbar.bad > i { background:var(--red); }
+  .scpillar { display:flex; justify-content:space-between; font-family:var(--mono);
+              font-size:11px; color:var(--dim); padding:2px 0; }
+  .scpillar b { color:var(--txt); font-weight:500; }
+  .scpillar.unknown { opacity:.55; }
+  .scissues { margin-top:8px; border-top:1px solid var(--border); padding-top:7px; }
+  .scissue { font-family:var(--mono); font-size:11px; color:var(--dim);
+             padding:2px 0; display:flex; gap:7px; }
+  .scissue .pts { color:var(--red); flex:0 0 30px; }
+  .scnote { font-family:var(--mono); font-size:10px; color:var(--dim);
+            margin-top:7px; opacity:.8; }
   .domchip { display:inline-flex; align-items:center; gap:6px; background:var(--panel2);
              border:1px solid var(--border); color:var(--txt); font-family:var(--mono);
              font-size:12px; border-radius:8px; padding:4px 8px; }
@@ -779,6 +816,17 @@ button:disabled{opacity:.45;cursor:wait;}
   </div>
 </div>
 
+<div class="panel" id="scorecard-section">
+  <div class="panelhead">
+    <h3>Security scorecard <span class="count" id="sccount"></span></h3>
+    <button class="btn panel-toggle" id="sc-toggle" type="button" aria-expanded="true" aria-controls="scbody">collapse</button>
+  </div>
+  <div class="panelbody" id="scbody">
+    <div class="invgrid" id="scsummary"></div>
+    <div class="scgrid" id="scgrid"></div>
+  </div>
+</div>
+
 <div class="panel findings" id="findings-section">
   <div class="findhead">
     <h3>Findings <span class="count" id="fcount"></span></h3>
@@ -1191,6 +1239,8 @@ function init() {
   if (swToggle) swToggle.addEventListener('click', () => togglePanel('swbody', 'sw-toggle'));
   const dnsToggle = $('dns-toggle');
   if (dnsToggle) dnsToggle.addEventListener('click', () => togglePanel('dnsbody', 'dns-toggle'));
+  const scToggle = $('sc-toggle');
+  if (scToggle) scToggle.addEventListener('click', () => togglePanel('scbody', 'sc-toggle'));
   $('ws-toggle').addEventListener('click', () => togglePanel('wsbody', 'ws-toggle'));
   $('fleetprev').addEventListener('click', () => changeFleetPage(-1));
   $('fleetnext').addEventListener('click', () => changeFleetPage(1));
@@ -2289,6 +2339,60 @@ function renderSoftware(d) {
   }).join('');
 }
 
+// ---- security scorecard -------------------------------------------------
+function renderScorecard(d) {
+  d = d || {};
+  const cards = d.domains || [];
+  const s = d.summary || {};
+  $('sccount').textContent = cards.length;
+  const stat = (label, value, cls) =>
+    `<div class="invstat ${cls || ''}">${esc(label)}<b>${esc(value)}</b></div>`;
+  const avg = (s.average_score !== undefined ? s.average_score : 0);
+  $('scsummary').innerHTML =
+    stat('domains', s.domains || 0) +
+    stat('assessed', s.assessed || 0) +
+    stat('average', avg + ' ' + (s.average_grade || '?'),
+         (avg >= 80 ? 'good' : (avg >= 55 ? 'warn' : 'bad'))) +
+    stat('worst', s.worst_score || 0,
+         ((s.worst_score || 0) >= 80 ? 'good' : ((s.worst_score || 0) >= 55 ? 'warn' : 'bad'))) +
+    stat('critical', s.with_critical || 0, (s.with_critical ? 'bad' : 'good'));
+  if (!cards.length) {
+    $('scgrid').innerHTML = '<div class="invempty">No scorecard yet — register a domain and run a scan.</div>';
+    return;
+  }
+  $('scgrid').innerHTML = cards.map(c => {
+    const g = c.grade || '?';
+    const gradeCls = (g === 'A' || g === 'B') ? '' : (g === 'C' ? 'warn' : 'bad');
+    const pillars = (c.pillars || []).map(p => {
+      const unk = p.unknown;
+      const val = unk ? '—' : (p.earned + '/' + p.max);
+      return `<div class="scpillar ${unk ? 'unknown' : ''}">
+        <span>${esc(p.label)}</span><b>${esc(val)}</b></div>`;
+    }).join('');
+    const issues = (c.issues || []).slice(0, 5).map(i =>
+      `<div class="scissue"><span class="pts">-${esc(i.points)}</span><span>${esc(i.label)}</span></div>`
+    ).join('') || '<div class="scissue"><span class="pts"></span><span>no deductions</span></div>';
+    const notes = [];
+    if (c.unknown) notes.push('not assessed');
+    else notes.push('coverage ' + esc(c.coverage) + '% · ' + esc(c.confidence) + ' confidence');
+    if (c.critical_cap) notes.push('capped: critical CVE');
+    if (c.coverage_cap) notes.push('grade limited by partial coverage');
+    const more = (c.issues || []).length > 5
+      ? `<div class="scissue"><span class="pts"></span><span>+${(c.issues || []).length - 5} more</span></div>` : '';
+    return `<div class="sccard grade-${esc(g)}">
+      <div class="schead">
+        <span class="scgrade">${esc(g)}</span>
+        <span class="scscore">${c.unknown ? '—' : esc(c.score) + '/100'}</span>
+        <span class="scdomain">${esc(c.domain)}</span>
+      </div>
+      <div class="scbar ${gradeCls}"><i style="width:${c.unknown ? 0 : esc(c.score)}%"></i></div>
+      ${pillars}
+      <div class="scissues">${issues}${more}</div>
+      <div class="scnote">${notes.join(' · ')}</div>
+    </div>`;
+  }).join('');
+}
+
 function loadInventories(seq) {
   fetch('/api/certificates?org=' + encodeURIComponent(currentOrg))
     .then((r) => r.json())
@@ -2301,6 +2405,10 @@ function loadInventories(seq) {
   fetch('/api/dns-posture?org=' + encodeURIComponent(currentOrg))
     .then((r) => r.json())
     .then((d) => { if (seq === undefined || seq === _refreshSeq) renderDnsPosture(d); })
+    .catch(() => {});
+  fetch('/api/scorecard?org=' + encodeURIComponent(currentOrg))
+    .then((r) => r.json())
+    .then((d) => { if (seq === undefined || seq === _refreshSeq) renderScorecard(d); })
     .catch(() => {});
 }
 

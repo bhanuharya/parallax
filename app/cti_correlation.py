@@ -1575,6 +1575,50 @@ def dns_posture(org=DEFAULT_ORG):
             "scanned": meta.get("date") or ""}
 
 
+def _cve_severity_map():
+    """{CVE id -> CRITICAL|HIGH} from the vendored map (scorecard input)."""
+    out = {}
+    try:
+        import cve_match
+        for entry in (cve_match.load_map() or {}).values():
+            for cve in entry.get("cves", []):
+                cid = str(cve.get("cve") or "").upper()
+                sev = str(cve.get("severity") or "").upper()
+                if cid and sev in ("CRITICAL", "HIGH"):
+                    # keep the worst severity if an id appears under two products
+                    if out.get(cid) != "CRITICAL":
+                        out[cid] = sev
+    except Exception:
+        pass
+    return out
+
+
+def scorecard(org=DEFAULT_ORG):
+    """Composite per-domain scorecard over the three inventories.
+
+    Deterministic and fully itemized: the response carries every deduction,
+    the coverage actually examined, and any cap that was applied, so a reader
+    can reproduce the number instead of trusting it.
+    """
+    fs, _ = load_data(org)
+    meta = load_meta(org)
+    domains = (REGISTRY.get(org) or {}).get("domains") or []
+    try:
+        import scorecard as sc
+    except Exception:                      # pragma: no cover - import guard
+        return {"summary": {"domains": 0}, "domains": [], "scanned": ""}
+    software_rows = software_from_meta(meta, fs)
+    cert_rows = certificates_from_meta(meta)
+    dns_results = meta.get("dns_posture") or []
+    if not isinstance(dns_results, list):
+        dns_results = []
+    cards = sc.build(domains, meta, software_rows=software_rows,
+                     cert_rows=cert_rows, dns_results=dns_results,
+                     severity_map=_cve_severity_map())
+    return {"summary": sc.summarize(cards), "domains": cards,
+            "scanned": meta.get("date") or ""}
+
+
 if __name__ == "__main__":
     g = build_graph()
     print("nodes:", len(g["nodes"]), "edges:", len(g["edges"]))

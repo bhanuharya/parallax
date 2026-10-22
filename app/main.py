@@ -589,6 +589,15 @@ def api_dns_posture(org: str = _DEFAULT_ORG, req: Request = None):
     return cc.dns_posture(org)
 
 
+@app.get("/api/scorecard")
+def api_scorecard(org: str = _DEFAULT_ORG, req: Request = None):
+    """Per-domain composite scorecard with itemized deductions and coverage."""
+    err = _read_auth(req, org)
+    if err:
+        return err
+    return cc.scorecard(org)
+
+
 @app.get("/api/findings")
 def api_findings(org: str = _DEFAULT_ORG, sort: str = None, status: str = "all", req: Request = None):
     err = _read_auth(req, org)

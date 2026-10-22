@@ -80,6 +80,32 @@ visualize its findings — no hardcoding to one company.
   product name without a version cannot be matched to an affected range. Each
   row carries a kind (`cms`, `js-framework`, `server-framework`, …) and a
   confidence, and the UI distinguishes "no version" from a version.
+- **Security scorecard** — a per-domain A–F rating over four weighted pillars:
+  **vulnerability exposure** (40, CVE-bearing software), **certificate
+  hygiene** (25), **email & DNS posture** (25), **exposed services** (10,
+  high-risk ports reachable from the internet). Every deduction is itemized
+  (`{code, label, points, detail}`) so the number is reproducible rather than
+  an opinion, and each card reports its **coverage** and confidence.
+
+  Three rules keep the rating honest:
+  - **Unknown is not good.** A pillar with no data is excluded from the
+    average (an outage must not read as a finding), but the resulting grade is
+    capped, because partial evidence cannot support a top score. A card below
+    30% coverage reports `?` rather than a number.
+  - **Critical exposure caps the grade.** A confirmed CRITICAL CVE cannot be
+    laundered into a B by clean certificates and DMARC elsewhere.
+  - **No double counting.** A host is attributed to exactly one registered
+    domain, so overlapping registrations (`example.com` + `www.example.com`)
+    do not score the same host twice.
+
+  Served by `GET /api/scorecard` and the dashboard **Security scorecard**
+  panel. Weights and deduction tables live in `app/scorecard.py`.
+
+  **Scope, stated plainly:** this is an *external*, evidence-based rating
+  built from what a passive scan can observe. It is not a SecurityScorecard
+  equivalent — there is no internal/agent telemetry, no peer benchmarking
+  dataset, no questionnaire-based vendor assessment, and no compliance
+  framework mapping. See [What this scorecard is and is not](#what-this-scorecard-is-and-is-not).
 - **Email & DNS posture** — per registered domain, a deterministic supply-chain
   posture check over public DNS: **SPF** (presence, `+all`/`~all` qualifier,
   RFC 7208 lookup budget), **DMARC** (policy none/quarantine/reject, `pct`,
@@ -268,6 +294,7 @@ Browser (dashboard.html)
 FastAPI (main.py) — all routes auth-gated
    ├─ GET  /api/orgs, /api/orgs/{slug}, /api/summary|graph|fleet|ips|findings
    ├─ GET  /api/certificates, /api/software, /api/dns-posture  (asset inventory)
+   ├─ GET  /api/scorecard                   (per-domain A-F rating + deductions)
    ├─ GET  /api/findings/{id}?org=          (normalized + masked + linked)
    ├─ GET  /api/orgs/{slug}/history          (append-only ledger)
    ├─ GET  /api/orgs/{slug}/report.pdf       (Chromium HTML→PDF, PII-masked)
@@ -400,6 +427,48 @@ The split is deliberately clean: **deterministic capture is the source of truth,
 $0, and self-healing; the LLM is an optional interpretive pass that adds
 vulnerability-context findings on top.**
 
+## What this scorecard is and is not
+
+The scorecard is often compared to commercial security-rating products
+(SecurityScorecard, BitSight, UpGuard). The comparison is useful for framing
+and misleading if taken literally, so the boundary is stated here explicitly.
+
+**What it does, using only externally observable evidence:**
+
+| Capability | Status here |
+|---|---|
+| Security rating per domain (A–F) | Yes — itemized, reproducible, weighted pillars |
+| Risk prioritization | Yes — every deduction carries points; issues sort by impact |
+| Continuous monitoring | Partly — each scan scores afresh; re-scan to track change |
+| Supply-chain / third-party surface | Yes — your own domains, software, certs, DNS |
+| Customizable dashboard | Partly — panels are fixed; weights are editable in code |
+| Executive reporting | Partly — PDF report exists; scorecard section is dashboard-only |
+
+**What it explicitly does not do:**
+
+- **No internal telemetry.** Everything derives from a passive external scan.
+  Endpoint agents, EDR, SIEM correlation and internal asset inventory are out
+  of scope by design — this tool never sees inside your network.
+- **No peer benchmarking.** Commercially meaningful ratings are calibrated
+  against an industry dataset of millions of companies. This rating is
+  *absolute and self-referential*: it tells you which of your own domains is
+  worst and whether it improved. Comparing your A to another company's A is
+  not meaningful, because both are scored against the same fixed rubric rather
+  than a population distribution.
+- **No questionnaire-based vendor assessment.** TPRM in the commercial sense
+  means scoring a *third party* on self-attested controls, contracts and
+  certifications. Here, "vendor risk" means only the externally visible parts
+  of your own supply chain (dangling CNAMEs to third-party services, disclosed
+  framework versions).
+- **No compliance framework mapping.** There is no SOC 2 / ISO 27001 / PCI
+  DSS control mapping. Posture checks align with good practice, but this
+  produces no audit evidence.
+- **No incident response, threat feeds or real-time alerting.** Threat intel is
+  limited to CISA KEV and FIRST EPSS for CVE prioritization.
+
+The honest one-line framing: **it is a defensible, explainable external
+security rating for domains you own — not a market-calibrated industry score.**
+
 ## OpenHack active-assessment authorization
 
 OpenHack is an **active external assessment**, not the passive CTI scanner. Use it
@@ -430,7 +499,7 @@ cd cti-dashboard
 python -m pytest tests/ -v
 ```
 
-321 tests covering: tenant authentication, unknown org rejection, graph XSS
+352 tests covering: tenant authentication, unknown org rejection, graph XSS
 prevention, PDF PII masking, job state retention, provider URL SSRF validation,
 session cookie security, CSP enforcement, registration limits, the
 cheap-model AI triage flow (pre-filter, compact prompt, classifier parsing,
@@ -456,7 +525,12 @@ grading, and dedup by identity_key across rescans), and the framework-detection
 layer (generator / asset-path / header / cookie signatures, version extraction
 and validation, identity-only detections excluded from CVE matching, per-product
 CVE attribution, plus the HTTP/1.1-vs-HTTP/2 curl response split that governs
-whether any body analysis runs at all).
+whether any body analysis runs at all), and the security scorecard (weighted
+pillars, itemized deductions, per-product CVE attribution, unknown-vs-assessed
+pillar handling, coverage-based grade capping, the critical-CVE cap, monotonic
+grading so a card cannot be laundered by clean hygiene elsewhere, single-domain
+host attribution to prevent double counting, and header/card grade
+consistency).
 
 ## Preview
 
