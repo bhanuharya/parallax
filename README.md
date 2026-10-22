@@ -67,6 +67,19 @@ visualize its findings — no hardcoding to one company.
   **Software & CVEs** panel. The inventory re-runs the offline CVE map itself,
   so a vulnerable version is flagged even when no finding was synthesized for
   it.
+- **Email & DNS posture** — per registered domain, a deterministic supply-chain
+  posture check over public DNS: **SPF** (presence, `+all`/`~all` qualifier,
+  RFC 7208 lookup budget), **DMARC** (policy none/quarantine/reject, `pct`,
+  reporting), **DKIM** (common-selector probe; null keys with empty `p=`
+  distinguished from usable keys), **DNSSEC** (DNSKEY + DS presence — reported
+  as chain-present, never as validated), **CAA** (authorised issuers), and
+  **MTA-STS**. Plus **dangling-CNAME takeover checks**: a subdomain pointing
+  at an unclaimed third-party service (S3, GitHub Pages, Heroku, Azure, …)
+  becomes a HIGH finding. Every check degrades to *unknown* — never a finding
+  — when a lookup fails, and an absent record is worded as a posture gap, not
+  a compromise. Served by `GET /api/dns-posture` and the dashboard **Email &
+  DNS posture** panel with a per-domain A–F grade; disable with
+  `CTI_DNS_POSTURE=0`.
 - **Correlation engine** — derives NEW findings from existing ones: CVE fleet-spread,
   IP co-residency, InternetDB source-backed exposure.
 - **Finding detail** — `found_date`, tier (CONFIRMED / CORRELATED / AI / CLEAN),
@@ -115,7 +128,10 @@ requirements.txt
 ## Requirements
 
 - **Python 3.11+**
-- **fastapi** + **uvicorn** (see `requirements.txt`)
+- **fastapi** + **uvicorn** + **dnspython** (see `requirements.txt`).
+  dnspython powers the SPF/DMARC/DKIM/DNSSEC/CAA lookups — the stdlib resolver
+  only exposes A/AAAA. It is imported lazily: without it, the DNS posture
+  stage degrades to "unknown" and every other scan stage still works.
 - **One process on one host.** State is JSON files guarded by process-local
   locks with in-memory sessions/jobs — multiple workers or two instances
   sharing a data directory can lose updates. See
@@ -238,7 +254,7 @@ Browser (dashboard.html)
    ▼
 FastAPI (main.py) — all routes auth-gated
    ├─ GET  /api/orgs, /api/orgs/{slug}, /api/summary|graph|fleet|ips|findings
-   ├─ GET  /api/certificates, /api/software  (asset inventory)
+   ├─ GET  /api/certificates, /api/software, /api/dns-posture  (asset inventory)
    ├─ GET  /api/findings/{id}?org=          (normalized + masked + linked)
    ├─ GET  /api/orgs/{slug}/history          (append-only ledger)
    ├─ GET  /api/orgs/{slug}/report.pdf       (Chromium HTML→PDF, PII-masked)
@@ -401,7 +417,7 @@ cd cti-dashboard
 python -m pytest tests/ -v
 ```
 
-235 tests covering: tenant authentication, unknown org rejection, graph XSS
+281 tests covering: tenant authentication, unknown org rejection, graph XSS
 prevention, PDF PII masking, job state retention, provider URL SSRF validation,
 session cookie security, CSP enforcement, registration limits, the
 cheap-model AI triage flow (pre-filter, compact prompt, classifier parsing,
@@ -418,7 +434,12 @@ neutralization), and the asset-inventory layer (certificate hostname matching
 RFC 6125 exact/wildcard/IP-SAN, expiry and chain and name-mismatch findings,
 inventory ordering and capping, software rows joined with CVEs both from the
 map and from findings, plus the authenticated `/api/certificates` and
-`/api/software` endpoints).
+`/api/software` endpoints), and the DNS posture layer (SPF qualifier and
+RFC 7208 lookup-budget scoring, DMARC policy/pct/reporting, null-vs-usable
+DKIM keys, DNSSEC DNSKEY/DS presence, CAA issuer parsing, MTA-STS, takeover
+provider matching plus dangling-target classification, unknown-vs-missing
+semantics so a resolver outage never becomes a finding, deterministic
+grading, and dedup by identity_key across rescans).
 
 ## Preview
 

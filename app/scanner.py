@@ -66,6 +66,12 @@ CERT_EXPIRY_WARN_DAYS = _env_int("CTI_CERT_EXPIRY_WARN_DAYS", 30)  # expiring-so
 CERT_SAN_CAP = _env_int("CTI_CERT_SAN_CAP", 50)                   # SANs kept per cert
 MAX_CERT_FINDINGS = _env_int("CTI_MAX_CERT_FINDINGS", 100)        # cert findings/scan
 
+# --- DNS / email-authentication posture tunables ---
+DNS_POSTURE_ENABLED = os.environ.get("CTI_DNS_POSTURE", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+DNS_MAX_DOMAINS = _env_int("CTI_DNS_MAX_DOMAINS", 10)      # domains assessed per scan
+DNS_TAKEOVER_HOST_CAP = _env_int("CTI_DNS_TAKEOVER_HOSTS", 25)  # CNAME probes per scan
+
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(\.(?!-)[A-Za-z0-9-]{1,63})+$")
 
 _PLACEHOLDERS = {
@@ -2602,6 +2608,157 @@ def synthesize_cert_findings(slug, certs):
     return out
 
 
+def synthesize_dns_findings(slug, dns_results):
+    """Deterministic findings from DNS / email-authentication posture.
+
+    One finding per (domain, failing check) so an operator can work each item
+    independently: spoofable mail (SPF/DMARC), unsigned zone, unauthorised CA
+    issuance (CAA), untrusted SMTP transport (MTA-STS), and dangling-CNAME
+    subdomain takeover (per host).
+
+    Everything here is evidence-based: a missing record is a posture gap, not
+    a compromise, and the wording says so. DKIM misses are skipped entirely —
+    custom selectors make absence unprovable, and a finding we cannot stand
+    behind is worse than no finding.
+
+    Deduped by (target, category) and keyed through identity_key so a check
+    that starts failing later produces a new finding rather than being hidden
+    behind the old one. Returns new finding dicts (NOT persisted).
+    """
+    out = []
+    existing = _existing_identity_keys(slug)
+    ts = time.strftime("%Y%m%d%H%M%S")
+    seq = 0
+
+    check_titles = {
+        "spf": "Email authentication: SPF",
+        "dmarc": "Email authentication: DMARC",
+        "caa": "Certificate issuance: CAA",
+        "dnssec": "DNS integrity: DNSSEC",
+        "mta_sts": "SMTP transport security: MTA-STS",
+        "takeover": "Subdomain takeover risk",
+    }
+    check_impact = {
+        "spf": "Without a restrictive SPF policy, anyone can send mail claiming to "
+               "be from this domain, which is the basis of phishing and BEC.",
+        "dmarc": "Without DMARC enforcement, receivers have no instruction to "
+                 "reject unauthenticated mail, so spoofed messages are delivered.",
+        "caa": "Without CAA, any public CA may issue a certificate for this domain, "
+               "widening the blast radius of a CA compromise or mis-issuance.",
+        "dnssec": "Without DNSSEC, DNS answers can be forged in transit, enabling "
+                  "traffic redirection and cache poisoning.",
+        "mta_sts": "Without MTA-STS, SMTP connections can be downgraded to plaintext "
+                   "or intercepted by a network attacker.",
+        "takeover": "A dangling CNAME lets a third party claim the target and serve "
+                    "content on your domain — full impersonation and cookie theft.",
+    }
+    check_remediation = {
+        "spf": ["Publish an SPF record ending in -all, and keep DNS-querying "
+                "mechanisms within the RFC 7208 limit of 10."],
+        "dmarc": ["Publish a DMARC record (start at p=none with rua for visibility, "
+                  "then move to p=quarantine and p=reject)."],
+        "caa": ["Publish CAA records naming the CAs you actually use, plus an "
+                "iodef reporting address."],
+        "dnssec": ["Sign the zone and publish a DS record at the registrar to "
+                   "complete the chain of trust."],
+        "mta_sts": ["Publish an MTA-STS policy in DNS plus the HTTPS policy file, "
+                    "and add a TLS-RPT reporting address."],
+        "takeover": ["Remove the dangling CNAME or re-register/claim the target "
+                     "resource in the third-party service."],
+    }
+
+    for res in dns_results or []:
+        domain = str(res.get("domain") or "").strip().lower()
+        if not domain:
+            continue
+        checks = res.get("checks") or {}
+
+        # --- per-check posture findings (one per domain+check) ---------------
+        for check in ("spf", "dmarc", "caa", "dnssec", "mta_sts"):
+            c = checks.get(check) or {}
+            sev = c.get("severity")
+            msgs = c.get("issues") or []
+            if not sev or sev == "INFO" or not msgs:
+                continue
+            # dnssec "unknown" (resolver unavailable) is not a finding
+            if check == "dnssec" and c.get("enabled") is None:
+                continue
+            ident = "dns|%s|%s" % (domain, check)
+            if ident in existing:
+                continue
+            seq += 1
+            out.append({
+                "id": "DNS-%s-%s-%02d" % (_slugify(slug), ts, seq),
+                "title": "%s — %s" % (check_titles[check], msgs[0][:90]),
+                "target": domain,
+                "ip": None,
+                "severity": sev,
+                "category": check_titles[check].lower(),
+                "status": "OPEN",
+                "status_detail": "SCAN-DETECTED (public DNS)",
+                "positive": False,
+                "mode": "fast",
+                "source": "scan-dns",
+                "description": "DNS posture check on %s: %s" % (domain, "; ".join(msgs)),
+                "impact": check_impact[check],
+                "evidence": {"check": check, "domain": domain,
+                             "severity": sev, "issues": msgs,
+                             "record": c.get("record") or None},
+                "proof_chain": ["Public DNS query for %s records of %s"
+                                % (check, domain)],
+                "remediation": list(check_remediation[check]),
+                "related_cves": [],
+                "found_date": time.strftime("%Y-%m-%d"),
+                "first_seen": time.strftime("%Y-%m-%d"),
+                "last_seen": time.strftime("%Y-%m-%d"),
+                "identity_key": ident,
+                "status_history": [{"at": time.strftime("%Y-%m-%d"), "from": "",
+                                    "to": "OPEN", "by": "scan",
+                                    "note": "DNS posture assessment"}],
+            })
+
+        # --- takeover: one finding per affected host ------------------------
+        for t in (checks.get("takeover") or []):
+            host = str(t.get("host") or "").strip().lower()
+            if not host:
+                continue
+            ident = "dns|%s|takeover" % host
+            if ident in existing:
+                continue
+            seq += 1
+            out.append({
+                "id": "DNS-%s-%s-%02d" % (_slugify(slug), ts, seq),
+                "title": "Subdomain takeover risk — dangling CNAME to %s" % t.get("provider"),
+                "target": host,
+                "ip": None,
+                "severity": t.get("severity") or "HIGH",
+                "category": check_titles["takeover"].lower(),
+                "status": "OPEN",
+                "status_detail": "SCAN-DETECTED (dangling CNAME)",
+                "positive": False,
+                "mode": "fast",
+                "source": "scan-dns",
+                "description": "%s is a CNAME to %s (%s), which no longer resolves. "
+                               "A third party who claims that name can serve content "
+                               "on %s." % (host, t.get("target"), t.get("provider"), host),
+                "impact": check_impact["takeover"],
+                "evidence": {"check": "takeover", "cname": t.get("target"),
+                             "provider": t.get("provider")},
+                "proof_chain": ["CNAME %s -> %s (target does not resolve)"
+                                % (host, t.get("target"))],
+                "remediation": list(check_remediation["takeover"]),
+                "related_cves": [],
+                "found_date": time.strftime("%Y-%m-%d"),
+                "first_seen": time.strftime("%Y-%m-%d"),
+                "last_seen": time.strftime("%Y-%m-%d"),
+                "identity_key": ident,
+                "status_history": [{"at": time.strftime("%Y-%m-%d"), "from": "",
+                                    "to": "OPEN", "by": "scan",
+                                    "note": "dangling CNAME check"}],
+            })
+    return out
+
+
 _SCAN_EVIDENCE_KEYS_EXTRA = ("services", "banners")
 
 # consecutive missed scans before a LOW/INFO/MEDIUM finding auto-resolves.
@@ -2851,6 +3008,32 @@ def _existing_target_category_keys(slug):
         for x in (d.get("findings") or []):
             keys.add((str(x.get("target", "")).strip().lower(),
                       str(x.get("category", "")).strip().lower()))
+    except Exception:
+        pass
+    return keys
+
+
+def _existing_identity_keys(slug):
+    """Set of identity_key values already recorded for an org.
+
+    Used by synthesizers whose findings carry their own explicit identity_key
+    (DNS posture checks, where the dedup unit is domain+check rather than
+    target+category and a check that starts failing later must surface as a
+    new finding).
+    """
+    keys = set()
+    try:
+        with open(cc.org_findings_path(slug)) as f:
+            d = json.load(f)
+        for x in (d.get("findings") or []):
+            ik = str(x.get("identity_key") or "").strip()
+            if ik:
+                keys.add(ik)
+                continue
+            try:
+                keys.add(cc.identity_key(x))
+            except Exception:
+                pass
     except Exception:
         pass
     return keys
@@ -3694,6 +3877,29 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
 
     _stage_done("tls")
 
+    # --- DNS / email-authentication posture (SPF, DMARC, DKIM, DNSSEC, CAA,
+    # MTA-STS) plus dangling-CNAME takeover checks on discovered hosts.
+    # Bounded and fail-open: a resolver problem degrades to "unknown" for that
+    # check and never fails the scan. Runs BEFORE the org lock (network I/O).
+    dns_results = []
+    if DNS_POSTURE_ENABLED:
+        _emit(on_progress, "capture", "DNS posture (SPF/DMARC/DKIM/DNSSEC/CAA)")
+        try:
+            import dns_posture
+            known_hosts = list(hosts.keys())[:DNS_TAKEOVER_HOST_CAP]
+            for dom in domains[:DNS_MAX_DOMAINS]:
+                try:
+                    dns_results.append(dns_posture.assess(dom, hosts=known_hosts))
+                except Exception as e:
+                    _log("debug", f"dns posture failed for {dom}: "
+                                  f"{type(e).__name__}: {e}")
+            if dns_results:
+                _emit(on_progress, "capture",
+                      f"{len(dns_results)} domain(s) assessed for DNS posture")
+        except Exception as e:
+            _log("warn", f"DNS posture stage unavailable: {type(e).__name__}: {e}")
+    _stage_done("dns")
+
     # --- optional NVD enrichment for matched CVEs (CTI_NVD_ENRICH=1) ---
     # runs BEFORE the org lock: network calls must never hold the write lock.
     # Fail-open by design — any error leaves the deterministic result alone.
@@ -3802,6 +4008,9 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
                 # healthy certs are queryable too (not just the ones that
                 # produced a finding). {host: {port, issuer_cn, not_after, ...}}
                 "certificates": {h: c for h, c in certs.items()},
+                # DNS / email-authentication posture per registered domain
+                # (SPF, DMARC, DKIM, DNSSEC, CAA, MTA-STS + takeover checks)
+                "dns_posture": dns_results,
                 # reconciliation bookkeeping for this scan
                 "reconcile": {
                     "observed": recon.get("observed", 0),
@@ -3829,6 +4038,7 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
                         slug, snippets, reached, services,
                         enumerated=list(hosts.keys()))),
                     ("tls", lambda: synthesize_cert_findings(slug, certs)),
+                    ("dns", lambda: synthesize_dns_findings(slug, dns_results)),
                     ("login", lambda: synthesize_login_findings(slug, snippets)),
                     ("version", lambda: synthesize_version_findings(slug, snippets)),
                     ("cve", lambda: synthesize_cve_findings(slug, snippets,

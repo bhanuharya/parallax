@@ -763,6 +763,22 @@ button:disabled{opacity:.45;cursor:wait;}
   </div>
 </div>
 
+<div class="panel" id="dns-section">
+  <div class="panelhead">
+    <h3>Email &amp; DNS posture <span class="count" id="dnscount"></span></h3>
+    <button class="btn panel-toggle" id="dns-toggle" type="button" aria-expanded="true" aria-controls="dnsbody">collapse</button>
+  </div>
+  <div class="panelbody" id="dnsbody">
+    <div class="invgrid" id="dnssummary"></div>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>domain</th><th>grade</th><th>SPF</th><th>DMARC</th><th>DNSSEC</th><th>CAA</th><th>issues</th></tr></thead>
+        <tbody id="dnsrows"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
 <div class="panel findings" id="findings-section">
   <div class="findhead">
     <h3>Findings <span class="count" id="fcount"></span></h3>
@@ -1173,6 +1189,8 @@ function init() {
   if (certToggle) certToggle.addEventListener('click', () => togglePanel('certbody', 'cert-toggle'));
   const swToggle = $('sw-toggle');
   if (swToggle) swToggle.addEventListener('click', () => togglePanel('swbody', 'sw-toggle'));
+  const dnsToggle = $('dns-toggle');
+  if (dnsToggle) dnsToggle.addEventListener('click', () => togglePanel('dnsbody', 'dns-toggle'));
   $('ws-toggle').addEventListener('click', () => togglePanel('wsbody', 'ws-toggle'));
   $('fleetprev').addEventListener('click', () => changeFleetPage(-1));
   $('fleetnext').addEventListener('click', () => changeFleetPage(1));
@@ -2274,7 +2292,56 @@ function loadInventories(seq) {
     .then((r) => r.json())
     .then((d) => { if (seq === undefined || seq === _refreshSeq) renderSoftware(d); })
     .catch(() => {});
+  fetch('/api/dns-posture?org=' + encodeURIComponent(currentOrg))
+    .then((r) => r.json())
+    .then((d) => { if (seq === undefined || seq === _refreshSeq) renderDnsPosture(d); })
+    .catch(() => {});
 }
+
+// ---- email & DNS posture ------------------------------------------------
+function _dnsBadge(ok, label) {
+  return `<span class="invtag ${ok ? 'good' : 'bad'}">${esc(label)}</span>`;
+}
+
+function renderDnsPosture(d) {
+  d = d || {};
+  const rows = d.domains || [];
+  const s = d.summary || {};
+  $('dnscount').textContent = rows.length;
+  const stat = (label, value, cls) =>
+    `<div class="invstat ${cls || ''}">${esc(label)}<b>${esc(value)}</b></div>`;
+  const gradeCls = (g) => (g === 'A' || g === 'B') ? 'good' : (g === 'C' || g === 'D' ? 'warn' : 'bad');
+  $('dnssummary').innerHTML =
+    stat('domains', s.domains || 0) +
+    stat('avg score', (s.average_score !== undefined ? s.average_score : 0),
+         (s.average_score >= 80 ? 'good' : (s.average_score >= 55 ? 'warn' : 'bad'))) +
+    stat('no DMARC', s.no_dmarc || 0, (s.no_dmarc ? 'bad' : 'good')) +
+    stat('no SPF', s.no_spf || 0, (s.no_spf ? 'bad' : 'good')) +
+    stat('takeover risks', s.takeover_risks || 0, (s.takeover_risks ? 'bad' : 'good'));
+  if (!rows.length) {
+    $('dnsrows').innerHTML = '<tr><td colspan="7" class="empty">No DNS posture data yet — run a scan.</td></tr>';
+    return;
+  }
+  $('dnsrows').innerHTML = rows.map(r => {
+    const c = r.checks || {};
+    const spf = c.spf || {}, dmarc = c.dmarc || {}, dnssec = c.dnssec || {}, caa = c.caa || {};
+    const spfTxt = spf.present ? (spf.all_qualifier === '-' ? 'strict' : 'present') : 'missing';
+    const dmarcTxt = dmarc.present ? (dmarc.policy || 'present') : 'missing';
+    const dnssecTxt = dnssec.enabled ? (dnssec.ds ? 'signed' : 'signed (no DS)') : 'unsigned';
+    const caaTxt = caa.present ? 'present' : 'missing';
+    const issueList = (r.issues || []).map(i => i.message).join('; ');
+    return `<tr>
+      <td class="mono">${esc(r.domain)}</td>
+      <td><span class="invtag ${gradeCls(r.grade)}">${esc(r.grade || '?')} ${esc(r.score !== undefined ? r.score : '')}</span></td>
+      <td>${_dnsBadge(spf.present && spf.all_qualifier === '-', spfTxt)}</td>
+      <td>${_dnsBadge(dmarc.policy === 'quarantine' || dmarc.policy === 'reject', dmarcTxt)}</td>
+      <td>${_dnsBadge(!!dnssec.enabled && !!dnssec.ds, dnssecTxt)}</td>
+      <td>${_dnsBadge(!!caa.present, caaTxt)}</td>
+      <td class="mono" style="font-size:11px">${esc(issueList.slice(0, 160))}</td>
+    </tr>`;
+  }).join('');
+}
+
 
 function togglePanel(bodyId, btnId) {
   const body = $(bodyId);

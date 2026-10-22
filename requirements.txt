@@ -1,2 +1,8 @@
 fastapi==0.141.1
 uvicorn[standard]==0.52.3
+
+# DNS record lookups (TXT/DMARC/DKIM/DNSSEC/CAA/MTA-STS). The stdlib resolver
+# only exposes A/AAAA, so SPF and DMARC analysis is impossible without this.
+# It is an optional runtime import: if absent, DNS posture degrades to
+# "unknown" and every other scan stage still works.
+dnspython==2.9.0

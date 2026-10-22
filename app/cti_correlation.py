@@ -1489,6 +1489,22 @@ def software(org=DEFAULT_ORG):
             "scanned": meta.get("date") or ""}
 
 
+def dns_posture(org=DEFAULT_ORG):
+    """DNS / email-authentication posture per registered domain."""
+    try:
+        import dns_posture as dp
+        summarize = dp.summarize
+    except Exception:                      # pragma: no cover - import guard
+        def summarize(rows):
+            return {"domains": len(rows or [])}
+    meta = load_meta(org)
+    results = meta.get("dns_posture") or []
+    if not isinstance(results, list):
+        results = []
+    return {"summary": summarize(results), "domains": results,
+            "scanned": meta.get("date") or ""}
+
+
 if __name__ == "__main__":
     g = build_graph()
     print("nodes:", len(g["nodes"]), "edges:", len(g["edges"]))
