@@ -1174,6 +1174,177 @@ def ip_sharing_from_data(fs):
     return [{"ip": ip, "hosts": sorted(hs)} for ip, hs in sorted(ip2hosts.items(), key=lambda x: -len(x[1]))]
 
 
+def certificates_from_meta(meta):
+    """Certificate inventory rows from scan meta, worst-first.
+
+    Covers every inspected host (healthy certs included), so the dashboard can
+    answer "what certificates do we have and when do they expire" rather than
+    only listing the ones that already produced a finding. Sorted by urgency:
+    expired, then days remaining ascending, then hostname mismatch.
+
+    `meta` is the org findings file's meta dict. Certificate data lives under
+    meta.certificates; findings are joined in by target so each row carries
+    the finding id a user can click through to.
+    """
+    meta = meta or {}
+    certs = meta.get("certificates") or {}
+    if not isinstance(certs, dict):
+        return []
+    rows = []
+    for host, c in certs.items():
+        if not isinstance(c, dict):
+            continue
+        days = c.get("days_left")
+        try:
+            days = int(days) if days is not None else None
+        except (TypeError, ValueError):
+            days = None
+        issues = []
+        if c.get("expired"):
+            issues.append("expired")
+        elif c.get("expiring_soon"):
+            issues.append("expiring soon")
+        if c.get("self_signed"):
+            issues.append("self-signed")
+        if c.get("hostname_ok") is False:
+            issues.append("hostname mismatch")
+        if c.get("chain_trusted") is False and not c.get("self_signed"):
+            issues.append("untrusted chain")
+        rows.append({
+            "host": str(host),
+            "port": c.get("port"),
+            "subject_cn": c.get("subject_cn") or "",
+            "issuer_cn": c.get("issuer_cn") or "",
+            "issuer_org": c.get("issuer_org") or "",
+            "not_after": c.get("not_after") or "",
+            "not_before": c.get("not_before") or "",
+            "days_left": days,
+            "expired": bool(c.get("expired")),
+            "expiring_soon": bool(c.get("expiring_soon")),
+            "self_signed": bool(c.get("self_signed")),
+            "hostname_ok": c.get("hostname_ok"),
+            "chain_trusted": c.get("chain_trusted"),
+            "san_count": c.get("san_count") or 0,
+            "sans": c.get("sans") or [],
+            "key_bits": c.get("key_bits"),
+            "issues": issues,
+            "status": "ISSUE" if issues else "OK",
+        })
+    # expiring/expired first, then fewest days left, then hosts with issues
+    rows.sort(key=lambda r: (
+        0 if r["expired"] else 1,
+        r["days_left"] if r["days_left"] is not None else 10 ** 6,
+        0 if r["issues"] else 1,
+        r["host"],
+    ))
+    return rows
+
+
+def certificate_summary(rows):
+    """Aggregate counts for the certificate inventory header."""
+    rows = rows or []
+    return {
+        "total": len(rows),
+        "ok": sum(1 for r in rows if not r["issues"]),
+        "expired": sum(1 for r in rows if r["expired"]),
+        "expiring_soon": sum(1 for r in rows if r["expiring_soon"]),
+        "self_signed": sum(1 for r in rows if r["self_signed"]),
+        "hostname_mismatch": sum(1 for r in rows if "hostname mismatch" in r["issues"]),
+        "untrusted_chain": sum(1 for r in rows if "untrusted chain" in r["issues"]),
+        "issuers": sorted({r["issuer_org"] or r["issuer_cn"] for r in rows
+                           if (r["issuer_org"] or r["issuer_cn"])}),
+    }
+
+
+def software_from_meta(meta, findings=None):
+    """Software inventory: observed product/version pairs plus matched CVEs.
+
+    Sources are the passive fingerprints captured per host (meta.fingerprints,
+    each carrying a `versions` list from banner/header/title parsing). CVEs are
+    resolved two ways and unioned per host:
+
+      - by re-running the offline CVE map against each observed pair, so the
+        inventory is correct even when finding synthesis was skipped or the
+        finding was deduped away by a previous scan;
+      - from existing `scan-cve` findings, which carry operator-visible ids.
+
+    One row per (host, product, version) so a host running several disclosed
+    products lists them all.
+    """
+    meta = meta or {}
+    fps = meta.get("fingerprints") or {}
+    findings = findings or []
+
+    # target -> cves seen in that host's CVE findings
+    cves_by_host = defaultdict(set)
+    finding_by_host = {}
+    for f in findings:
+        if str(f.get("source", "")) != "scan-cve":
+            continue
+        tgt = str(f.get("target", "")).strip().lower()
+        for c in _norm_cves(f.get("related_cves")):
+            cves_by_host[tgt].add(c)
+        finding_by_host.setdefault(tgt, f.get("id"))
+
+    try:
+        import cve_match
+    except Exception:          # pragma: no cover - import guard for app paths
+        cve_match = None
+
+    rows = []
+    for host, s in (fps.items() if isinstance(fps, dict) else []):
+        if not isinstance(s, dict):
+            continue
+        h = str(host)
+        versions = s.get("versions") or []
+        if not isinstance(versions, list) or not versions:
+            continue
+        host_cves = set(cves_by_host.get(h.strip().lower(), set()))
+        if cve_match is not None:
+            try:
+                for m in cve_match.match_cves(versions):
+                    if m.get("cve"):
+                        host_cves.add(str(m["cve"]))
+            except Exception:
+                pass
+        host_cves = sorted(host_cves)
+        for v in versions:
+            if not isinstance(v, dict):
+                continue
+            product = str(v.get("product") or "").strip()
+            version = str(v.get("version") or "").strip()
+            if not product and not version:
+                continue
+            rows.append({
+                "host": h,
+                "product": product,
+                "version": version,
+                "url": s.get("url") or "",
+                "server": s.get("server") or "",
+                "x_powered_by": s.get("x-powered-by") or "",
+                "related_cves": host_cves,
+                "cve_count": len(host_cves),
+                "finding_id": finding_by_host.get(h.strip().lower()),
+            })
+    rows.sort(key=lambda r: (-r["cve_count"], r["host"], r["product"]))
+    return rows
+
+
+def software_summary(rows):
+    """Aggregate counts for the software inventory header."""
+    rows = rows or []
+    prod = defaultdict(int)
+    for r in rows:
+        if r["product"]:
+            prod[r["product"].lower()] += 1
+    return {
+        "total": len(rows),
+        "hosts": len({r["host"] for r in rows}),
+        "vulnerable": sum(1 for r in rows if r["cve_count"]),
+        "products": sorted(prod.items(), key=lambda x: -x[1])[:20],
+    }
+
+
 def build_graph_from_data(fs, baseline, domains=None):
     """Correlation graph from in-memory findings/baseline/domains."""
     fs = fs or []
@@ -1291,6 +1462,31 @@ def ip_sharing(org=DEFAULT_ORG):
 def summary(org=DEFAULT_ORG):
     fs, baseline = load_data(org)
     return summary_from_data(fs, baseline)
+
+
+def certificates(org=DEFAULT_ORG):
+    """Certificate inventory for an org (all inspected hosts, worst-first)."""
+    fs, _ = load_data(org)
+    meta = load_meta(org)
+    rows = certificates_from_meta(meta)
+    # attach the finding id for each host so the UI can drill through
+    by_host = {}
+    for f in (fs or []):
+        if str(f.get("source", "")) == "scan-tls":
+            by_host.setdefault(str(f.get("target", "")).strip().lower(), f.get("id"))
+    for r in rows:
+        r["finding_id"] = by_host.get(r["host"].strip().lower())
+    return {"summary": certificate_summary(rows), "certificates": rows,
+            "scanned": meta.get("date") or ""}
+
+
+def software(org=DEFAULT_ORG):
+    """Software/version inventory for an org, with matched CVE counts."""
+    fs, _ = load_data(org)
+    meta = load_meta(org)
+    rows = software_from_meta(meta, fs)
+    return {"summary": software_summary(rows), "software": rows,
+            "scanned": meta.get("date") or ""}
 
 
 if __name__ == "__main__":

@@ -61,6 +61,11 @@ RECHECK_STREAK_MITIGATE = 2
 NVD_MAX_LOOKUPS = _env_int("CTI_NVD_MAX_LOOKUPS", 20)  # NVD API calls per scan
 MAX_DIFF_FINDINGS = _env_int("CTI_MAX_DIFF_FINDINGS", 50)  # new-exposure findings/scan
 
+# --- certificate inventory tunables ---
+CERT_EXPIRY_WARN_DAYS = _env_int("CTI_CERT_EXPIRY_WARN_DAYS", 30)  # expiring-soon window
+CERT_SAN_CAP = _env_int("CTI_CERT_SAN_CAP", 50)                   # SANs kept per cert
+MAX_CERT_FINDINGS = _env_int("CTI_MAX_CERT_FINDINGS", 100)        # cert findings/scan
+
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(\.(?!-)[A-Za-z0-9-]{1,63})+$")
 
 _PLACEHOLDERS = {
@@ -566,30 +571,106 @@ def parse_versions(text):
     return out
 
 
+def _cert_rdn(info, section, field):
+    """First value of `field` (e.g. commonName) inside a decoded cert section."""
+    for rdn in (info.get(section) or ()):
+        for k, v in rdn:
+            if k == field:
+                return str(v)[:120]
+    return ""
+
+
+def _hostname_matches_cert(host, san_entries, subject_cn):
+    """True if `host` is covered by the cert's SANs (or a CN fallback).
+
+    RFC 6125 matching: exact FQDN, or a single leading wildcard label
+    (`*.example.com` covers `a.example.com`, not `a.b.example.com`).
+    IP-literal hosts must match an IP SAN exactly.
+    """
+    h = str(host or "").strip().lower().rstrip(".")
+    if not h:
+        return False
+    try:
+        ipaddress.ip_address(h)
+        wants_ip = True
+    except ValueError:
+        wants_ip = False
+
+    for entry in san_entries or ():
+        try:
+            kind, value = str(entry[0]).strip().lower(), str(entry[1]).strip().lower().rstrip(".")
+        except (IndexError, TypeError):
+            continue
+        # stdlib emits "IP Address" / "DNS"; compare case-insensitively
+        if kind == "ip address":
+            if wants_ip and value == h:
+                return True
+            continue
+        if kind != "dns" or wants_ip:
+            continue
+        if value == h:
+            return True
+        if value.startswith("*."):
+            suffix = value[1:]  # ".example.com"
+            if h.endswith(suffix) and h.count(".") == suffix.count("."):
+                return True
+    # CN fallback applies only when the cert has no SAN extension at all
+    if not san_entries and subject_cn and not wants_ip:
+        cn = subject_cn.strip().lower().rstrip(".")
+        if cn == h:
+            return True
+        if cn.startswith("*.") and h.endswith(cn[1:]) and h.count(".") == cn.count("."):
+            return True
+    return False
+
+
 def _tls_cert(host, ip=None, port=443, timeout=6):
     """Inspect the TLS certificate via a stdlib handshake (non-intrusive).
 
-    Returns a compact dict {not_after, days_left, expired, self_signed,
-    issuer_cn, san_count} or None. This is the data behind the new
-    expired/expiring/self-signed deterministic findings.
+    Returns a compact dict describing the served certificate:
+        not_after, not_before, days_left, expired, expiring_soon, self_signed,
+        issuer_cn, issuer_org, subject_cn, san_count, sans, hostname_ok,
+        chain_trusted, chain_error, key_bits
+    or None when no certificate could be retrieved.
+
+    The capture handshake deliberately ignores validation errors so an expired
+    or untrusted certificate is still recorded — that is the point of the
+    check. Chain validity is then tested separately against the system trust
+    store, so a self-signed or incomplete chain is distinguishable from a
+    healthy cert issued by a public CA.
     """
     try:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE  # we want the cert even when invalid
+        ctx.verify_mode = ssl.CERT_NONE  # capture the cert even when invalid
         connect_to = ip or host
+        der = None
+        key_bits = None
         with socket.create_connection((connect_to, port), timeout=timeout) as sock:
-            if ip and ip != host:
-                # SNI must carry the real hostname while connecting by IP
-                with ctx.wrap_socket(sock, server_hostname=host) as tls:
-                    der = tls.getpeercert(binary_form=True)
-            else:
-                with ctx.wrap_socket(sock, server_hostname=host) as tls:
-                    der = tls.getpeercert(binary_form=True)
+            # SNI must carry the real hostname while connecting by IP
+            with ctx.wrap_socket(sock, server_hostname=host) as tls:
+                der = tls.getpeercert(binary_form=True)
+                ci = tls.cipher()
+                if ci:
+                    key_bits = ci[2]
         if not der:
             return None
-        # parse without cryptography lib: load into an ssl-friendly DER->PEM and
-        # use _ssl._test_decode_cert (stdlib, used by CPython's own tests)
+
+        # Independent chain check against the system trust store. This catches
+        # self-signed certs, missing intermediates and expired roots that the
+        # CERT_NONE capture above would otherwise accept silently.
+        chain_trusted, chain_error = False, ""
+        try:
+            vctx = ssl.create_default_context()
+            with socket.create_connection((connect_to, port), timeout=timeout) as vsock:
+                with vctx.wrap_socket(vsock, server_hostname=host):
+                    chain_trusted = True
+        except ssl.SSLCertVerificationError as e:
+            chain_error = str(getattr(e, "verify_message", "") or e)[:160]
+        except Exception as e:
+            chain_error = type(e).__name__
+
+        # parse without the cryptography lib: DER -> PEM -> stdlib decoder
         import tempfile as _tmp
         import datetime
         pem = ssl.DER_cert_to_PEM_cert(der)
@@ -606,6 +687,7 @@ def _tls_cert(host, ip=None, port=443, timeout=6):
             except OSError:
                 pass
         not_after = str(info.get("notAfter", "")).strip()
+        not_before = str(info.get("notBefore", "")).strip()
         days_left = None
         expired = None
         try:
@@ -615,25 +697,31 @@ def _tls_cert(host, ip=None, port=443, timeout=6):
             expired = days_left < 0
         except Exception:
             pass
-        issuer_parts = info.get("issuer") or ()
-        issuer_cn = ""
-        for rdn in issuer_parts:
-            for k, v in rdn:
-                if k == "commonName":
-                    issuer_cn = str(v)[:80]
-        subject_parts = info.get("subject") or ()
-        subject_cn = ""
-        for rdn in subject_parts:
-            for k, v in rdn:
-                if k == "commonName":
-                    subject_cn = str(v)[:80]
-        san_count = len((info.get("subjectAltName") or []))
+        issuer_cn = _cert_rdn(info, "issuer", "commonName")
+        issuer_org = _cert_rdn(info, "issuer", "organizationName")
+        subject_cn = _cert_rdn(info, "subject", "commonName")
+        sans = info.get("subjectAltName") or ()
         self_signed = bool(issuer_cn) and bool(subject_cn) and issuer_cn == subject_cn
-        out = {"not_after": not_after[:40], "issuer_cn": issuer_cn,
-               "self_signed": self_signed, "san_count": san_count}
+        out = {
+            "not_after": not_after[:40],
+            "not_before": not_before[:40],
+            "issuer_cn": issuer_cn,
+            "issuer_org": issuer_org,
+            "subject_cn": subject_cn,
+            "san_count": len(sans),
+            "sans": [str(s[1])[:120] for s in sans[:CERT_SAN_CAP]
+                     if isinstance(s, (list, tuple)) and len(s) > 1],
+            "self_signed": self_signed,
+            "hostname_ok": _hostname_matches_cert(host, sans, subject_cn),
+            "chain_trusted": chain_trusted,
+            "chain_error": chain_error,
+        }
         if days_left is not None:
             out["days_left"] = days_left
             out["expired"] = bool(expired)
+            out["expiring_soon"] = bool(0 <= days_left <= CERT_EXPIRY_WARN_DAYS)
+        if key_bits:
+            out["key_bits"] = int(key_bits)
         return out
     except Exception as e:
         _log("debug", f"TLS inspect failed for {host}:{port}: {type(e).__name__}")
@@ -2429,13 +2517,21 @@ def synthesize_cert_findings(slug, certs):
     ts = time.strftime("%Y%m%d%H%M%S")
     seq = 0
     for h in sorted(certs):
+        if len(out) >= MAX_CERT_FINDINGS:
+            break
         c = certs.get(h) or {}
         port = int(c.get("port") or 443)
         issues = []
         if c.get("expired"):
             issues.append("expired")
+        elif c.get("expiring_soon"):
+            issues.append("expiring soon")
         if c.get("self_signed"):
             issues.append("self-signed")
+        if c.get("hostname_ok") is False:
+            issues.append("hostname mismatch")
+        if c.get("chain_trusted") is False and not c.get("self_signed"):
+            issues.append("untrusted chain")
         if not issues:
             continue
         key = (str(h).strip().lower(), "tls certificate")
@@ -2443,21 +2539,36 @@ def synthesize_cert_findings(slug, certs):
             continue
         seq += 1
         expired = "expired" in issues
+        soon = "expiring soon" in issues
+        mismatch = "hostname mismatch" in issues
         days = c.get("days_left")
         desc = "TLS certificate on %s is %s" % (h, " and ".join(issues))
         if expired and days is not None:
             desc += " (expired %d day(s) ago, notAfter %s)" % (-int(days), c.get("not_after") or "?")
-        elif expired:
+        elif days is not None:
+            desc += " (expires in %d day(s), notAfter %s)" % (int(days), c.get("not_after") or "?")
+        else:
             desc += " (notAfter %s)" % (c.get("not_after") or "?")
         if c.get("issuer_cn"):
             desc += " Issuer CN: %s." % c.get("issuer_cn")
+        if mismatch:
+            desc += (" The certificate's subject/SANs do not cover this hostname, so "
+                     "clients cannot validate it and see a name-mismatch warning.")
+        if c.get("chain_error"):
+            desc += " Chain verification failed: %s." % c.get("chain_error")
+        if expired or mismatch:
+            sev = "MEDIUM"
+        elif soon:
+            sev = "LOW"
+        else:
+            sev = "LOW"
         out.append({
             "id": "TLS-%s-%s-%02d" % (_slugify(slug), ts, seq),
             "title": "%s TLS certificate" % (" and ".join(issues).capitalize()),
             "target": h,
             "ip": None,
             "port": port,
-            "severity": "MEDIUM" if expired else "LOW",
+            "severity": sev,
             "category": "TLS certificate",
             "status": "OPEN",
             "status_detail": "SCAN-DETECTED (TLS handshake)",
@@ -2466,12 +2577,20 @@ def synthesize_cert_findings(slug, certs):
             "source": "scan-tls",
             "description": desc,
             "impact": ("Clients can observe a MITM on this host; expired certs break trust "
-                       "and may allow interception." if expired
-                       else "Self-signed cert indicates a non-CA-issued identity; verify the host is intended."),
+                       "and may allow interception." if expired else
+                       "Clients see a certificate warning and cannot verify host identity, "
+                       "normalising the habit of clicking through TLS errors." if mismatch else
+                       "Certificate expiry will break trust for users and integrations unless "
+                       "renewed before the notAfter date." if soon else
+                       "Self-signed cert indicates a non-CA-issued identity; verify the host is intended."),
             "evidence": {"port": port, **{k: v for k, v in c.items() if v is not None}},
             "proof_chain": ["TLS certificate inspection: %s:%d (stdlib handshake, CERT_NONE)" % (h, port)],
             "remediation": ["Renew/reissue the certificate from a trusted CA and redeploy."
                             if expired else
+                            "Renew the certificate before the notAfter date (automate ACME renewal)."
+                            if soon else
+                            "Reissue the certificate with this hostname in the SAN list."
+                            if mismatch else
                             "Replace the self-signed certificate with a CA-issued one or document why it is acceptable."],
             "related_cves": [],
             "found_date": time.strftime("%Y-%m-%d"),
@@ -3679,6 +3798,10 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
                 "fingerprints": {h: s for h, s in snippets.items()},
                 # per-host open service ports (TCP connect scan), {host: {ip, open: {port: svc}}}
                 "services": services,
+                # full TLS certificate inventory for every inspected host, so
+                # healthy certs are queryable too (not just the ones that
+                # produced a finding). {host: {port, issuer_cn, not_after, ...}}
+                "certificates": {h: c for h, c in certs.items()},
                 # reconciliation bookkeeping for this scan
                 "reconcile": {
                     "observed": recon.get("observed", 0),

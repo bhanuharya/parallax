@@ -90,6 +90,21 @@
   .wsdomrow { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   .wsdomrow input { flex:1 1 220px; width:auto; }
   .domchips { display:flex; flex-wrap:wrap; gap:6px; margin-top:2px; }
+  /* asset inventory (certificates / software) */
+  .invgrid { display:flex; flex-wrap:wrap; gap:8px; padding:4px 0 12px; }
+  .invstat { background:var(--panel2); border:1px solid var(--border); border-radius:8px;
+             padding:6px 10px; font-family:var(--mono); font-size:11px; color:var(--dim); }
+  .invstat b { display:block; font-size:16px; color:var(--txt); margin-top:2px; }
+  .invstat.bad b { color:var(--red); }
+  .invstat.warn b { color:var(--yellow); }
+  .invstat.good b { color:var(--green); }
+  .invtag { display:inline-block; font-size:10px; font-family:var(--mono);
+            border-radius:6px; padding:2px 7px; margin:1px 4px 1px 0;
+            border:1px solid var(--border); color:var(--dim); }
+  .invtag.bad { color:var(--red); border-color:var(--red); }
+  .invtag.warn { color:var(--yellow); border-color:var(--yellow); }
+  .invtag.good { color:var(--green); border-color:var(--green); }
+  .invempty { color:var(--dim); font-family:var(--mono); font-size:12px; padding:10px 2px; }
   .domchip { display:inline-flex; align-items:center; gap:6px; background:var(--panel2);
              border:1px solid var(--border); color:var(--txt); font-family:var(--mono);
              font-size:12px; border-radius:8px; padding:4px 8px; }
@@ -716,6 +731,38 @@ button:disabled{opacity:.45;cursor:wait;}
   </div>
 </div>
 
+<div class="panel" id="cert-section">
+  <div class="panelhead">
+    <h3>Certificates <span class="count" id="certcount"></span></h3>
+    <button class="btn panel-toggle" id="cert-toggle" type="button" aria-expanded="true" aria-controls="certbody">collapse</button>
+  </div>
+  <div class="panelbody" id="certbody">
+    <div class="invgrid" id="certsummary"></div>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>host</th><th>issuer</th><th>expires</th><th>days</th><th>state</th></tr></thead>
+        <tbody id="certs"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="panel" id="software-section">
+  <div class="panelhead">
+    <h3>Software &amp; CVEs <span class="count" id="swcount"></span></h3>
+    <button class="btn panel-toggle" id="sw-toggle" type="button" aria-expanded="true" aria-controls="swbody">collapse</button>
+  </div>
+  <div class="panelbody" id="swbody">
+    <div class="invgrid" id="swsummary"></div>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>host</th><th>product</th><th>version</th><th>CVEs</th></tr></thead>
+        <tbody id="software"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
 <div class="panel findings" id="findings-section">
   <div class="findhead">
     <h3>Findings <span class="count" id="fcount"></span></h3>
@@ -1122,6 +1169,10 @@ function init() {
   $('findings-collapseall').addEventListener('click', () => setAllCollapsed(!allCollapsed));
   $('fleet-toggle').addEventListener('click', () => togglePanel('fleetbody', 'fleet-toggle'));
   $('ips-toggle').addEventListener('click', () => togglePanel('ipsbody', 'ips-toggle'));
+  const certToggle = $('cert-toggle');
+  if (certToggle) certToggle.addEventListener('click', () => togglePanel('certbody', 'cert-toggle'));
+  const swToggle = $('sw-toggle');
+  if (swToggle) swToggle.addEventListener('click', () => togglePanel('swbody', 'sw-toggle'));
   $('ws-toggle').addEventListener('click', () => togglePanel('wsbody', 'ws-toggle'));
   $('fleetprev').addEventListener('click', () => changeFleetPage(-1));
   $('fleetnext').addEventListener('click', () => changeFleetPage(1));
@@ -1908,6 +1959,7 @@ function refreshAll() {
     try { if (d.findings) renderFindings(d.findings); } catch (e) {}
     try { if (d.history) renderHistory(d.history); } catch (e) {}
     try { renderScanInfo(d.scan_info); } catch (e) {}
+    try { loadInventories(seq); } catch (e) {}
     stampAsOf();
   }).catch(() => {
     if (seq !== _refreshSeq) return;
@@ -1923,6 +1975,7 @@ function refreshAll() {
         '&status=' + encodeURIComponent(statusFilter)).then((r) => r.json()).then(guard(renderFindings)).catch(() => {}),
       fetch('/api/orgs/' + encodeURIComponent(currentOrg) + '/history').then((r) => r.json()).then(guard(renderHistory)).catch(() => {})
     ];
+    try { loadInventories(seq); } catch (e) {}
     return Promise.allSettled(tasks).then(() => { if (seq === _refreshSeq) stampAsOf(); });
   });
 }
@@ -2141,6 +2194,86 @@ function changeIpsPage(delta) {
   const pages = Math.max(1, Math.ceil(ipList.length / ipPageSize));
   ipPage = Math.min(pages, Math.max(1, ipPage + delta));
   renderIpsPage();
+}
+
+// ---- asset inventory: certificates -------------------------------------
+function renderCertificates(d) {
+  d = d || {};
+  const rows = d.certificates || [];
+  const s = d.summary || {};
+  $('certcount').textContent = rows.length;
+  const stat = (label, value, cls) =>
+    `<div class="invstat ${cls || ''}">${esc(label)}<b>${esc(value)}</b></div>`;
+  $('certsummary').innerHTML =
+    stat('total', s.total || 0) +
+    stat('ok', s.ok || 0, 'good') +
+    stat('expired', s.expired || 0, (s.expired ? 'bad' : '')) +
+    stat('expiring ≤30d', s.expiring_soon || 0, (s.expiring_soon ? 'warn' : '')) +
+    stat('name mismatch', s.hostname_mismatch || 0, (s.hostname_mismatch ? 'warn' : '')) +
+    stat('self-signed', s.self_signed || 0, (s.self_signed ? 'warn' : ''));
+  if (!rows.length) {
+    $('certs').innerHTML = '<tr><td colspan="5" class="empty">No certificates captured yet — run a scan.</td></tr>';
+    return;
+  }
+  const issueTag = (t) => {
+    const cls = /expired|mismatch|untrusted/.test(t) ? 'bad' : 'warn';
+    return `<span class="invtag ${cls}">${esc(t)}</span>`;
+  };
+  $('certs').innerHTML = rows.map(r => {
+    const days = (r.days_left === null || r.days_left === undefined) ? '—' : r.days_left;
+    const daysCls = r.expired ? 'bad' : (r.expiring_soon ? 'warn' : 'good');
+    const state = r.issues && r.issues.length
+      ? r.issues.map(issueTag).join('')
+      : '<span class="invtag good">ok</span>';
+    return `<tr>
+      <td class="mono">${esc(r.host)}</td>
+      <td>${esc(r.issuer_org || r.issuer_cn || '—')}</td>
+      <td class="mono">${esc(r.not_after || '—')}</td>
+      <td class="num ${daysCls === 'bad' ? 'bad' : ''}">${esc(days)}</td>
+      <td>${state}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ---- asset inventory: software & CVEs ----------------------------------
+function renderSoftware(d) {
+  d = d || {};
+  const rows = d.software || [];
+  const s = d.summary || {};
+  $('swcount').textContent = rows.length;
+  const stat = (label, value, cls) =>
+    `<div class="invstat ${cls || ''}">${esc(label)}<b>${esc(value)}</b></div>`;
+  $('swsummary').innerHTML =
+    stat('disclosures', s.total || 0) +
+    stat('hosts', s.hosts || 0) +
+    stat('with CVEs', s.vulnerable || 0, (s.vulnerable ? 'bad' : 'good'));
+  if (!rows.length) {
+    $('software').innerHTML = '<tr><td colspan="4" class="empty">No version disclosures captured yet — run a scan.</td></tr>';
+    return;
+  }
+  $('software').innerHTML = rows.map(r => {
+    const cves = (r.related_cves || []);
+    const cveCell = cves.length
+      ? cves.map(c => `<span class="invtag bad">${esc(c)}</span>`).join('')
+      : '<span class="invtag good">none</span>';
+    return `<tr>
+      <td class="mono">${esc(r.host)}</td>
+      <td>${esc(r.product || '—')}</td>
+      <td class="mono">${esc(r.version || '—')}</td>
+      <td>${cveCell}</td>
+    </tr>`;
+  }).join('');
+}
+
+function loadInventories(seq) {
+  fetch('/api/certificates?org=' + encodeURIComponent(currentOrg))
+    .then((r) => r.json())
+    .then((d) => { if (seq === undefined || seq === _refreshSeq) renderCertificates(d); })
+    .catch(() => {});
+  fetch('/api/software?org=' + encodeURIComponent(currentOrg))
+    .then((r) => r.json())
+    .then((d) => { if (seq === undefined || seq === _refreshSeq) renderSoftware(d); })
+    .catch(() => {});
 }
 
 function togglePanel(bodyId, btnId) {

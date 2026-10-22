@@ -562,6 +562,24 @@ def api_ips(org: str = _DEFAULT_ORG, req: Request = None):
     return cc.ip_sharing(org)
 
 
+@app.get("/api/certificates")
+def api_certificates(org: str = _DEFAULT_ORG, req: Request = None):
+    """Certificate inventory: every inspected host with expiry/chain/name status."""
+    err = _read_auth(req, org)
+    if err:
+        return err
+    return cc.certificates(org)
+
+
+@app.get("/api/software")
+def api_software(org: str = _DEFAULT_ORG, req: Request = None):
+    """Software inventory: disclosed product/version pairs joined with CVE matches."""
+    err = _read_auth(req, org)
+    if err:
+        return err
+    return cc.software(org)
+
+
 @app.get("/api/findings")
 def api_findings(org: str = _DEFAULT_ORG, sort: str = None, status: str = "all", req: Request = None):
     err = _read_auth(req, org)

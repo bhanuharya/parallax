@@ -41,7 +41,7 @@ visualize its findings — no hardcoding to one company.
   still found. **Wildcard-DNS filtering** drops names that only echo a `*.` record.
 - **Offline version→CVE matching** — software versions parsed from headers,
   titles and service banners (SSH/FTP/SMTP/MySQL) are matched against a vendored
-  high-impact CVE map (`app/cve_data.json`, 22 products / 36 CVEs). Matches are
+  high-impact CVE map (`app/cve_data.json`, 28 products / 46 CVEs). Matches are
   tiered **CORRELATED** with an explicit verify caveat and confidence
   (LOW/MED) badges — deterministic, offline, $0. Optional **NVD 2.0
   enrichment** (`CTI_NVD_ENRICH=1`) adds official CVSS score/vector,
@@ -53,8 +53,20 @@ visualize its findings — no hardcoding to one company.
   baseline: newly resolved hosts and newly open service ports become
   CONFIRMED findings, so attack-surface growth is tracked over time. A
   dashboard quick-filter isolates them.
-- **TLS certificate inspection** — stdlib handshake (no payload) on HTTPS hosts:
-  expired and self-signed certificates become deterministic findings.
+- **Certificate inventory** — every HTTPS host's certificate is captured via a
+  stdlib handshake (no payload) and stored in scan meta, so healthy certs are
+  browsable, not just broken ones. Records subject/issuer, notBefore/notAfter,
+  days remaining, SAN list, key size, and three independent verdicts:
+  hostname match (RFC 6125 exact/wildcard/IP-SAN), chain trust against the
+  system store, and self-signed. Expired, **expiring within 30 days**
+  (`CTI_CERT_EXPIRY_WARN_DAYS`), hostname-mismatched, self-signed and
+  untrusted-chain certs each become deterministic findings. Served by
+  `GET /api/certificates` and the dashboard **Certificates** panel.
+- **Software inventory** — disclosed product/version pairs per host, joined
+  with matched CVEs, served by `GET /api/software` and the dashboard
+  **Software & CVEs** panel. The inventory re-runs the offline CVE map itself,
+  so a vulnerable version is flagged even when no finding was synthesized for
+  it.
 - **Correlation engine** — derives NEW findings from existing ones: CVE fleet-spread,
   IP co-residency, InternetDB source-backed exposure.
 - **Finding detail** — `found_date`, tier (CONFIRMED / CORRELATED / AI / CLEAN),
@@ -226,6 +238,7 @@ Browser (dashboard.html)
    ▼
 FastAPI (main.py) — all routes auth-gated
    ├─ GET  /api/orgs, /api/orgs/{slug}, /api/summary|graph|fleet|ips|findings
+   ├─ GET  /api/certificates, /api/software  (asset inventory)
    ├─ GET  /api/findings/{id}?org=          (normalized + masked + linked)
    ├─ GET  /api/orgs/{slug}/history          (append-only ledger)
    ├─ GET  /api/orgs/{slug}/report.pdf       (Chromium HTML→PDF, PII-masked)
@@ -258,17 +271,20 @@ captures service banners (SSH/FTP/SMTP/etc. greetings) for every reachable port,
 fingerprints reachable hosts, TCP-connects common service ports on resolved IPs, and enriches
 IPs from InternetDB. It then derives **deterministic findings directly**:
 
-1. **Version→CVE match** (offline) — disclosed versions vs the vendored map →
+1. **Certificate inventory** — every HTTPS host's cert is captured (subject,
+   issuer, expiry, SANs, key bits) along with hostname-match, chain-trust and
+   self-signed verdicts; problem certs become findings.
+2. **Version→CVE match** (offline) — disclosed versions vs the vendored map →
    advisory CORRELATED finding per host with NVD links and confidence.
-2. **Security headers** — missing HSTS/CSP/XFO/XCTO → LOW/MEDIUM finding.
-3. **New exposure** — diff vs the previous scan's baseline (new hosts / newly
+3. **Security headers** — missing HSTS/CSP/XFO/XCTO → LOW/MEDIUM finding.
+4. **New exposure** — diff vs the previous scan's baseline (new hosts / newly
    open ports) → CONFIRMED finding.
 
 And the correlation engine adds derived findings from existing ones:
 
-4. **CVE correlation** — any host sharing a CVE with a known finding → new finding.
-5. **IP co-residency** — other hosts on a confirmed finding's IP → new finding.
-6. **InternetDB** — exposed vulnerable port/CPE → source-backed finding.
+5. **CVE correlation** — any host sharing a CVE with a known finding → new finding.
+6. **IP co-residency** — other hosts on a confirmed finding's IP → new finding.
+7. **InternetDB** — exposed vulnerable port/CPE → source-backed finding.
 
 Generated findings are tagged `CORRELATED` / `AI-ASSESSED` and are distinct from
 `CONFIRMED` originals; the dashboard's **Correlated** tab isolates them.
@@ -385,7 +401,7 @@ cd cti-dashboard
 python -m pytest tests/ -v
 ```
 
-198 tests covering: tenant authentication, unknown org rejection, graph XSS
+235 tests covering: tenant authentication, unknown org rejection, graph XSS
 prevention, PDF PII masking, job state retention, provider URL SSRF validation,
 session cookie security, CSP enforcement, registration limits, the
 cheap-model AI triage flow (pre-filter, compact prompt, classifier parsing,
@@ -396,9 +412,13 @@ findings, the Wayback/OTX enum sources + wildcard-DNS filtering, the offline
 version→CVE map (comparator edges, alias normalization, banner-derived
 versions, no-correlation-amplification) + optional NVD enrichment
 (cache, fail-open), security-header findings, baseline-diff new-exposure
-sequencing, resolver-pool + InternetDB-cache behavior, and evidence-based AI
+sequencing, resolver-pool + InternetDB-cache behavior, evidence-based AI
 prompt enrichment (CVE candidates, missing-header signals, sanitizer
-neutralization).
+neutralization), and the asset-inventory layer (certificate hostname matching
+RFC 6125 exact/wildcard/IP-SAN, expiry and chain and name-mismatch findings,
+inventory ordering and capping, software rows joined with CVEs both from the
+map and from findings, plus the authenticated `/api/certificates` and
+`/api/software` endpoints).
 
 ## Preview
 

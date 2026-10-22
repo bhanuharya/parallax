@@ -222,6 +222,67 @@
          "ranges": [">=2.2,<2.2.14", ">=3.0,<3.0.4"],
          "summary": "JSON-RPC profile.idx2 SQL injection enables login bypass and data exfiltration"}
       ]
+    },
+    "openssl": {
+      "aliases": ["openssl", "openssl-fips"],
+      "cves": [
+        {"cve": "CVE-2022-3602", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "3.0.7",
+         "ranges": [">=3.0,<3.0.7"],
+         "summary": "X.509 email address 4-byte buffer overflow in punycode decoding enables crash / potential RCE (3.0.x line)"},
+        {"cve": "CVE-2023-0286", "severity": "HIGH", "cvss": 7.4, "fix_version": "3.0.8",
+         "ranges": [">=3.0,<3.0.8"],
+         "summary": "X.400 address type confusion in X.509 GeneralName enables cross-type read and DoS"}
+      ]
+    },
+    "big-ip": {
+      "aliases": ["big-ip", "bigip", "f5 big-ip", "f5", "big-ip apm"],
+      "cves": [
+        {"cve": "CVE-2022-1388", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "16.1.3",
+         "ranges": [">=16.1,<16.1.3", ">=15.1,<15.1.6", ">=14.1,<14.1.5",
+                    ">=13.1,<13.1.5", ">=12.1,<12.1.7"],
+         "summary": "iControl REST authentication bypass enables unauthenticated remote command execution as root"},
+        {"cve": "CVE-2023-46747", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "17.1.1",
+         "ranges": [">=17.1,<17.1.1", ">=16.1,<16.1.4", ">=15.1,<15.1.9", ">=14.1,<14.1.5"],
+         "summary": "Configuration utility authentication bypass (request smuggling) enables unauthenticated admin access"}
+      ]
+    },
+    "moveit": {
+      "aliases": ["moveit", "moveit transfer", "moveit automation", "progress moveit"],
+      "cves": [
+        {"cve": "CVE-2023-34362", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "2023.0.1",
+         "ranges": ["<2023.0.1"],
+         "summary": "SQL injection in the MOVEit Transfer web app enables unauthenticated RCE (Cl0p mass exploitation)"}
+      ]
+    },
+    "citrix": {
+      "aliases": ["citrix", "netscaler", "citrix adc", "citrix gateway", "netscaler adc"],
+      "cves": [
+        {"cve": "CVE-2023-3519", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "13.1.49",
+         "ranges": [">=13.0,<13.0.92", ">=13.1,<13.1.49", ">=12.1,<12.1.65"],
+         "summary": "Unauthenticated stack overflow in NetScaler ADC/Gateway enables remote code execution"},
+        {"cve": "CVE-2019-19781", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "13.0.47.24",
+         "ranges": [">=10.5,<10.5.70", ">=11.1,<11.1.63", ">=12.0,<12.0.63", ">=12.1,<12.1.55", ">=13.0,<13.0.47"],
+         "summary": "Path traversal in the ADC/Gateway VPN portal enables unauthenticated RCE"}
+      ]
+    },
+    "jira": {
+      "aliases": ["jira", "atlassian jira", "jira software", "jira core"],
+      "cves": [
+        {"cve": "CVE-2019-11581", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "8.4.0",
+         "ranges": [">=7.6,<7.13.10", ">=8.0,<8.4.0"],
+         "summary": "Server-side template injection in the Contact Administrators form enables unauthenticated RCE"}
+      ]
+    },
+    "exchange": {
+      "aliases": ["exchange", "microsoft exchange", "exchange server", "owa"],
+      "cves": [
+        {"cve": "CVE-2021-34473", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "15.2.792.10",
+         "ranges": [">=15.0,<15.1.2242", ">=15.1,<15.1.2308", ">=15.2,<15.2.792"],
+         "summary": "ProxyShell: path confusion in Autodiscover enables unauthenticated RCE (chained with CVE-2021-34523 / 31207)"},
+        {"cve": "CVE-2021-26855", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "15.0.1497.2",
+         "ranges": [">=15.0,<15.0.1497", ">=15.1,<15.1.2176", ">=15.2,<15.2.792"],
+         "summary": "ProxyLogon: SSRF in the Exchange HTTP protocol enables authentication bypass and RCE"}
+      ]
     }
   }
 }
