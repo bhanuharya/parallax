@@ -41,7 +41,7 @@ visualize its findings — no hardcoding to one company.
   still found. **Wildcard-DNS filtering** drops names that only echo a `*.` record.
 - **Offline version→CVE matching** — software versions parsed from headers,
   titles and service banners (SSH/FTP/SMTP/MySQL) are matched against a vendored
-  high-impact CVE map (`app/cve_data.json`, 28 products / 46 CVEs). Matches are
+  high-impact CVE map (`app/cve_data.json`, 33 products / 59 CVEs). Matches are
   tiered **CORRELATED** with an explicit verify caveat and confidence
   (LOW/MED) badges — deterministic, offline, $0. Optional **NVD 2.0
   enrichment** (`CTI_NVD_ENRICH=1`) adds official CVSS score/vector,
@@ -66,7 +66,20 @@ visualize its findings — no hardcoding to one company.
   with matched CVEs, served by `GET /api/software` and the dashboard
   **Software & CVEs** panel. The inventory re-runs the offline CVE map itself,
   so a vulnerable version is flagged even when no finding was synthesized for
-  it.
+  it. CVEs are attributed **per product**, not per host, so a page running
+  WordPress + jQuery + Bootstrap shows each component's own CVEs.
+- **Framework & CMS detection** — `app/tech_detect.py` identifies the
+  application stack, not just the web server, using only evidence a normal
+  visitor receives: the `<meta name="generator">` tag (WordPress/Drupal/Joomla
+  with versions), version-bearing asset paths (`jquery-3.6.0.min.js`,
+  `bootstrap-5.3.0.min.css`, `ng-version="17.0.0"`), framework headers
+  (`X-AspNet-Version`, `X-Drupal-Cache`, `X-Nextjs-Cache`) and session cookie
+  names (`laravel_session`, `csrftoken`, `PHPSESSID`). Versioned detections
+  feed CVE matching; identity-only detections (e.g. Next.js with no version in
+  the markup) are inventory-only and are **never** CVE-matched, because a
+  product name without a version cannot be matched to an affected range. Each
+  row carries a kind (`cms`, `js-framework`, `server-framework`, …) and a
+  confidence, and the UI distinguishes "no version" from a version.
 - **Email & DNS posture** — per registered domain, a deterministic supply-chain
   posture check over public DNS: **SPF** (presence, `+all`/`~all` qualifier,
   RFC 7208 lookup budget), **DMARC** (policy none/quarantine/reject, `pct`,
@@ -417,7 +430,7 @@ cd cti-dashboard
 python -m pytest tests/ -v
 ```
 
-281 tests covering: tenant authentication, unknown org rejection, graph XSS
+321 tests covering: tenant authentication, unknown org rejection, graph XSS
 prevention, PDF PII masking, job state retention, provider URL SSRF validation,
 session cookie security, CSP enforcement, registration limits, the
 cheap-model AI triage flow (pre-filter, compact prompt, classifier parsing,
@@ -439,7 +452,11 @@ RFC 7208 lookup-budget scoring, DMARC policy/pct/reporting, null-vs-usable
 DKIM keys, DNSSEC DNSKEY/DS presence, CAA issuer parsing, MTA-STS, takeover
 provider matching plus dangling-target classification, unknown-vs-missing
 semantics so a resolver outage never becomes a finding, deterministic
-grading, and dedup by identity_key across rescans).
+grading, and dedup by identity_key across rescans), and the framework-detection
+layer (generator / asset-path / header / cookie signatures, version extraction
+and validation, identity-only detections excluded from CVE matching, per-product
+CVE attribution, plus the HTTP/1.1-vs-HTTP/2 curl response split that governs
+whether any body analysis runs at all).
 
 ## Preview
 

@@ -144,7 +144,71 @@
       "cves": [
         {"cve": "CVE-2019-19844", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "2.2.9",
          "ranges": [">=2.2,<2.2.9", ">=2.1,<2.1.16", ">=1.11,<1.11.27"],
-         "summary": "Password-reset SQL injection / account takeover via crafted reset email (PostgreSQL)"}
+         "summary": "Password-reset SQL injection / account takeover via crafted reset email (PostgreSQL)"},
+        {"cve": "CVE-2021-35042", "severity": "HIGH", "cvss": 7.5, "fix_version": "3.2.5",
+         "ranges": [">=3.1,<3.1.13", ">=3.2,<3.2.5"],
+         "summary": "SQL injection via unvalidated QuerySet.order_by() input"},
+        {"cve": "CVE-2022-28346", "severity": "HIGH", "cvss": 7.5, "fix_version": "4.0.4",
+         "ranges": [">=2.2,<2.2.28", ">=3.2,<3.2.13", ">=4.0,<4.0.4"],
+         "summary": "SQL injection in QuerySet.annotate()/aggregate() with untrusted dict keys"},
+        {"cve": "CVE-2023-46695", "severity": "HIGH", "cvss": 7.5, "fix_version": "4.2.7",
+         "ranges": [">=4.1,<4.1.13", ">=4.2,<4.2.7"],
+         "summary": "Potential denial of service in UsernameField on Windows (NFKC normalization)"}
+      ]
+    },
+    "rails": {
+      "aliases": ["rails", "ruby on rails", "railties"],
+      "cves": [
+        {"cve": "CVE-2019-5418", "severity": "HIGH", "cvss": 7.5, "fix_version": "5.2.2.1",
+         "ranges": [">=5.0.0,<5.2.2.1", ">=4.2.0,<4.2.11.1"],
+         "summary": "File content disclosure (path traversal) via Accept header in Action View render"},
+        {"cve": "CVE-2020-8163", "severity": "HIGH", "cvss": 7.5, "fix_version": "5.2.4.3",
+         "ranges": [">=5.0.0,<5.2.4.3"],
+         "summary": "Remote code execution via user-supplied locals in the inline method (Action View)"},
+        {"cve": "CVE-2022-32224", "severity": "HIGH", "cvss": 8.8, "fix_version": "7.0.3.1",
+         "ranges": [">=5.2,<5.2.8.1", ">=6.0,<6.0.5.1", ">=6.1,<6.1.6.1", ">=7.0,<7.0.3.1"],
+         "summary": "YAML deserialization can lead to RCE when untrusted YAML is loaded"}
+      ]
+    },
+    "joomla": {
+      "aliases": ["joomla"],
+      "cves": [
+        {"cve": "CVE-2015-8562", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "3.4.6",
+         "ranges": [">=1.5.0,<3.4.6"],
+         "summary": "Unserialize/object injection via HTTP headers enables unauthenticated RCE"},
+        {"cve": "CVE-2023-23752", "severity": "HIGH", "cvss": 7.5, "fix_version": "4.2.8",
+         "ranges": [">=4.0.0,<4.2.8"],
+         "summary": "Improper access check on the webservice API exposes config incl. credentials"}
+      ]
+    },
+    "jquery": {
+      "aliases": ["jquery"],
+      "cves": [
+        {"cve": "CVE-2020-11022", "severity": "HIGH", "cvss": 7.5, "fix_version": "3.5.0",
+         "ranges": [">=1.2,<3.5.0"],
+         "summary": "XSS via htmlPrefilter when passing untrusted HTML to DOM manipulation methods"},
+        {"cve": "CVE-2019-11358", "severity": "HIGH", "cvss": 7.5, "fix_version": "3.4.0",
+         "ranges": [">=0.1,<3.4.0"],
+         "summary": "Prototype pollution in jQuery.extend(true, {}, ...) — Object.prototype pollution"}
+      ]
+    },
+    "bootstrap": {
+      "aliases": ["bootstrap"],
+      "cves": [
+        {"cve": "CVE-2019-8331", "severity": "HIGH", "cvss": 7.5, "fix_version": "4.3.1",
+         "ranges": [">=3.0.0,<3.4.1", ">=4.0.0,<4.3.1"],
+         "summary": "XSS in the tooltip/collapse data-parent attribute via untrusted content"},
+        {"cve": "CVE-2024-6484", "severity": "HIGH", "cvss": 7.5, "fix_version": "3.4.1",
+         "ranges": [">=3.0.0,<3.4.1"],
+         "summary": "XSS via the collapse plugin's data-parent selector"}
+      ]
+    },
+    "angular": {
+      "aliases": ["angular", "angularjs"],
+      "cves": [
+        {"cve": "CVE-2023-26116", "severity": "HIGH", "cvss": 7.5, "fix_version": "16.2.0",
+         "ranges": [">=0.0.0,<16.2.0"],
+         "summary": "AngularJS/Angular prototype pollution via angular.merge on untrusted input"}
       ]
     },
     "drupal": {

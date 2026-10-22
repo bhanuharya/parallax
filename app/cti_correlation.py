@@ -1256,6 +1256,15 @@ def certificate_summary(rows):
     }
 
 
+def _kind_for(product):
+    """Coarse category for a detected product ('cms', 'js-framework', ...)."""
+    try:
+        import tech_detect
+        return tech_detect.kind_of(product)
+    except Exception:
+        return "other"
+
+
 def software_from_meta(meta, findings=None):
     """Software inventory: observed product/version pairs plus matched CVEs.
 
@@ -1297,35 +1306,91 @@ def software_from_meta(meta, findings=None):
             continue
         h = str(host)
         versions = s.get("versions") or []
+        # framework detections carry their own kind/confidence/source; an
+        # identity-only detection (no version) is still inventory-worthy but
+        # is NEVER CVE-matched, so it is emitted with an empty version
+        details = s.get("tech_detail") or []
+        detail_by_product = {}
+        if isinstance(details, list):
+            for d in details:
+                if isinstance(d, dict) and d.get("product"):
+                    detail_by_product[str(d["product"]).lower()] = d
         if not isinstance(versions, list) or not versions:
-            continue
+            # no banner versions; a framework may still be identifiable below
+            versions = []
         host_cves = set(cves_by_host.get(h.strip().lower(), set()))
+        # CVE attribution must be PER PRODUCT, not per host: matching the
+        # host's whole version list against the map and then showing that set
+        # on every row would put the WordPress CVE on the nginx row. Each
+        # product is matched on its own pair.
+        cves_by_product = {}
         if cve_match is not None:
-            try:
-                for m in cve_match.match_cves(versions):
-                    if m.get("cve"):
-                        host_cves.add(str(m["cve"]))
-            except Exception:
-                pass
-        host_cves = sorted(host_cves)
-        for v in versions:
+            for v in (versions if isinstance(versions, list) else []):
+                if not isinstance(v, dict):
+                    continue
+                prod = str(v.get("product") or "").strip().lower()
+                if not prod:
+                    continue
+                try:
+                    hits = cve_match.match_cves([v])
+                except Exception:
+                    hits = []
+                ids = {str(m["cve"]) for m in hits if m.get("cve")}
+                cves_by_product.setdefault(prod, set()).update(ids)
+        # findings-declared CVEs remain a host-level fallback for products the
+        # live map does not cover (e.g. an AI- or NVD-derived match)
+        seen_rows = set()
+
+        def _emit(product, version, source, confidence, versioned):
+            key = (product.lower(), version)
+            if key in seen_rows:
+                return
+            seen_rows.add(key)
+            det = detail_by_product.get(product.lower()) or {}
+            prod_cves = set(cves_by_product.get(product.lower(), set()))
+            if not prod_cves and not version:
+                prod_cves = set()          # identity-only: nothing to match
+            elif not prod_cves:
+                # no product-level match; fall back to host-level only when
+                # this is the host's sole versioned product (unambiguous)
+                versioned_products = [x for x in (versions if isinstance(versions, list) else [])
+                                      if isinstance(x, dict) and x.get("version")]
+                if len(versioned_products) == 1:
+                    prod_cves = set(host_cves)
+            rows.append({
+                "host": h,
+                "product": product,
+                "version": version,
+                "kind": det.get("kind") or _kind_for(product),
+                "confidence": det.get("confidence") or confidence,
+                "detected_by": det.get("source") or source,
+                "versioned": bool(version),
+                "url": s.get("url") or "",
+                "server": s.get("server") or "",
+                "x_powered_by": s.get("x-powered-by") or "",
+                "related_cves": sorted(prod_cves),
+                "cve_count": len(prod_cves),
+                "finding_id": finding_by_host.get(h.strip().lower()),
+            })
+
+        for v in (versions if isinstance(versions, list) else []):
             if not isinstance(v, dict):
                 continue
             product = str(v.get("product") or "").strip()
             version = str(v.get("version") or "").strip()
             if not product and not version:
                 continue
-            rows.append({
-                "host": h,
-                "product": product,
-                "version": version,
-                "url": s.get("url") or "",
-                "server": s.get("server") or "",
-                "x_powered_by": s.get("x-powered-by") or "",
-                "related_cves": host_cves,
-                "cve_count": len(host_cves),
-                "finding_id": finding_by_host.get(h.strip().lower()),
-            })
+            det = detail_by_product.get(product.lower()) or {}
+            _emit(product, version, "banner", det.get("confidence") or "medium",
+                  bool(version))
+        # identity-only framework detections (no version to match against)
+        for d in (details if isinstance(details, list) else []):
+            if not isinstance(d, dict) or d.get("version"):
+                continue
+            product = str(d.get("product") or "").strip()
+            if product:
+                _emit(product, "", d.get("source") or "html",
+                      d.get("confidence") or "low", False)
     rows.sort(key=lambda r: (-r["cve_count"], r["host"], r["product"]))
     return rows
 
@@ -1334,14 +1399,19 @@ def software_summary(rows):
     """Aggregate counts for the software inventory header."""
     rows = rows or []
     prod = defaultdict(int)
+    kind = defaultdict(int)
     for r in rows:
         if r["product"]:
             prod[r["product"].lower()] += 1
+        if r.get("kind"):
+            kind[r["kind"]] += 1
     return {
         "total": len(rows),
         "hosts": len({r["host"] for r in rows}),
         "vulnerable": sum(1 for r in rows if r["cve_count"]),
+        "versioned": sum(1 for r in rows if r.get("versioned")),
         "products": sorted(prod.items(), key=lambda x: -x[1])[:20],
+        "kinds": dict(sorted(kind.items(), key=lambda x: -x[1])),
     }
 
 

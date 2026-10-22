@@ -756,7 +756,7 @@ button:disabled{opacity:.45;cursor:wait;}
     <div class="invgrid" id="swsummary"></div>
     <div class="table-scroll">
       <table>
-        <thead><tr><th>host</th><th>product</th><th>version</th><th>CVEs</th></tr></thead>
+        <thead><tr><th>host</th><th>product</th><th>version</th><th>kind</th><th>CVEs</th></tr></thead>
         <tbody id="software"></tbody>
       </table>
     </div>
@@ -2264,9 +2264,10 @@ function renderSoftware(d) {
   $('swsummary').innerHTML =
     stat('disclosures', s.total || 0) +
     stat('hosts', s.hosts || 0) +
+    stat('versioned', s.versioned || 0) +
     stat('with CVEs', s.vulnerable || 0, (s.vulnerable ? 'bad' : 'good'));
   if (!rows.length) {
-    $('software').innerHTML = '<tr><td colspan="4" class="empty">No version disclosures captured yet — run a scan.</td></tr>';
+    $('software').innerHTML = '<tr><td colspan="5" class="empty">No software detected yet — run a scan.</td></tr>';
     return;
   }
   $('software').innerHTML = rows.map(r => {
@@ -2274,10 +2275,15 @@ function renderSoftware(d) {
     const cveCell = cves.length
       ? cves.map(c => `<span class="invtag bad">${esc(c)}</span>`).join('')
       : '<span class="invtag good">none</span>';
+    // no version => identity-only detection, which cannot be CVE-matched
+    const verCell = r.version
+      ? `<span class="mono">${esc(r.version)}</span>`
+      : '<span class="invtag">no version</span>';
     return `<tr>
       <td class="mono">${esc(r.host)}</td>
       <td>${esc(r.product || '—')}</td>
-      <td class="mono">${esc(r.version || '—')}</td>
+      <td>${verCell}</td>
+      <td><span class="invtag">${esc(r.kind || 'other')}</span></td>
       <td>${cveCell}</td>
     </tr>`;
   }).join('');

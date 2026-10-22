@@ -26,6 +26,7 @@ from collections import Counter, defaultdict
 import cti_correlation as cc
 import ai_providers
 import cve_match
+import tech_detect
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 BASE = os.path.dirname(BASE)
@@ -71,6 +72,9 @@ DNS_POSTURE_ENABLED = os.environ.get("CTI_DNS_POSTURE", "1").strip().lower() \
     not in ("0", "false", "no", "off")
 DNS_MAX_DOMAINS = _env_int("CTI_DNS_MAX_DOMAINS", 10)      # domains assessed per scan
 DNS_TAKEOVER_HOST_CAP = _env_int("CTI_DNS_TAKEOVER_HOSTS", 25)  # CNAME probes per scan
+
+# --- framework detection ---
+TECH_DETECT_CAP = _env_int("CTI_TECH_DETECT_CAP", 16)      # detections kept per host
 
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(\.(?!-)[A-Za-z0-9-]{1,63})+$")
 
@@ -743,6 +747,30 @@ def _resolve_args(host, ips):
     return args
 
 
+def _split_headers_body(raw):
+    """Split a `curl -D - -o -` response into (header_block, body).
+
+    curl emits the two protocols differently: an HTTP/1.1 response separates
+    the header block from the body with CRLF CRLF, while an **HTTP/2** response
+    uses a bare LF LF. Splitting only on CRLF CRLF therefore yields an EMPTY
+    body for every HTTP/2 site — which is most of the modern web — silently
+    disabling all body-based analysis (title, <meta generator>, tech
+    signatures, login-form detection, version parsing). Verified against
+    wordpress.org / example.com / github.com, all of which return HTTP/2.
+
+    Returns ("", "") when the input is empty. The body is returned unmodified
+    (only the separator is consumed) so non-UTF8 content is not corrupted.
+    """
+    raw = raw or ""
+    crlf = raw.find("\r\n\r\n")
+    lf = raw.find("\n\n")
+    if crlf != -1 and (lf == -1 or crlf <= lf):
+        return raw[:crlf], raw[crlf + 4:]
+    if lf != -1:
+        return raw[:lf], raw[lf + 2:]
+    return raw, ""
+
+
 def _fetch_fingerprint(host, timeout=8, ips=None):
     """Single-request reachability probe + rich evidence capture.
 
@@ -774,7 +802,7 @@ def _fetch_fingerprint(host, timeout=8, ips=None):
             raw = (r.stdout or "")
             if len(raw) > CURL_MAX_BYTES:
                 raw = raw[:CURL_MAX_BYTES]
-            headers_blob, _, body = raw.partition("\r\n\r\n")
+            headers_blob, body = _split_headers_body(raw)
             if not headers_blob and not body:
                 continue
             m = re.search(r"^HTTP/[0-9.]+ (\d{3})", headers_blob, re.M)
@@ -829,6 +857,24 @@ def _fetch_fingerprint(host, timeout=8, ips=None):
                 for pv in parse_versions(src):
                     if pv not in versions:
                         versions.append(pv)
+            # --- framework/CMS detection ---
+            # The header/title parser above finds web servers; the application
+            # stack (WordPress, Django, Rails, jQuery, ...) is what most
+            # exploitable CVEs actually live in. Versioned detections are
+            # folded into `versions` so the existing CVE matcher covers them;
+            # the full detection list is kept for the inventory UI.
+            try:
+                detections = tech_detect.detect(
+                    html=body_head, headers=snippet,
+                    generator=snippet.get("generator"),
+                    cookies=snippet.get("cookies") or [])
+                if detections:
+                    snippet["tech_detail"] = detections[:TECH_DETECT_CAP]
+                    for pv in tech_detect.as_versions(detections):
+                        if pv not in versions:
+                            versions.append(pv)
+            except Exception as e:
+                _log("debug", f"tech detect failed for {host}: {type(e).__name__}: {e}")
             if versions:
                 snippet["versions"] = versions
             return probe, snippet
