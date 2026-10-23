@@ -76,9 +76,10 @@ def _reload_registry():
 
 
 def org_list():
-    """[{slug, name, domains}, ...] sorted by slug."""
+    """[{slug, name, domains, ip_ranges}, ...] sorted by slug."""
     return [{"slug": slug, "name": (o.get("name") or slug),
-             "domains": o.get("domains") or []}
+             "domains": o.get("domains") or [],
+             "ip_ranges": o.get("ip_ranges") or []}
             for slug, o in sorted(REGISTRY.items())]
 
 
@@ -2119,7 +2120,7 @@ def hosts_from_snapshot(domains, meta, fs, only=None):
         for i in issues:
             counts[i["severity"]] += 1
         rows.append({
-            "host": c["host"], "domain": c["parent"],
+            "host": c["host"], "domain": c["parent"], "kind": c.get("kind", "domain"),
             "score": None if c["unknown"] else c["score"], "grade": c["grade"],
             "coverage": c["coverage"], "confidence": c["confidence"], "unknown": c["unknown"],
             "critical_exposure": bool(c.get("critical_exposure")),

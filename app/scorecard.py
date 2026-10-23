@@ -46,6 +46,7 @@ Design rules, following risk.py and dns_posture.py:
     confirmed critical exposure (a critical CVE match, a compromised CDN, a
     subdomain open to takeover) caps the total at 60.
 """
+import ipaddress
 import re
 from collections import defaultdict
 
@@ -1010,6 +1011,31 @@ def _dns_for_host(dns_result, host):
     return dict(dns_result, checks=kept, score=score, grade=grade, issues=issues)
 
 
+def _range_groups(meta, observed):
+    """[(cidr, [ip, ...])] for the scan's IP-range addresses that were observed.
+
+    Range addresses have no registered domain, so they are grouped under the
+    first range containing them and get no email & DNS verdict (unknown).
+    """
+    nets = []
+    for r in meta.get("ip_ranges") or []:
+        try:
+            nets.append((str(r), ipaddress.ip_network(str(r), strict=False)))
+        except ValueError:
+            continue
+    groups = {cidr: [] for cidr, _ in nets}
+    for h in sorted(set(meta.get("range_hosts") or []) & observed):
+        try:
+            ip = ipaddress.ip_address(h)
+        except ValueError:
+            continue
+        for cidr, net in nets:
+            if ip in net:
+                groups[cidr].append(h)
+                break
+    return [(cidr, ips) for cidr, ips in groups.items() if ips]
+
+
 def build_hosts(domains, meta, software_rows=None, cert_rows=None, dns_results=None,
                 severity_map=None, exploited=(), only=None, explain=False):
     """One card per observed host (subdomain): the same model applied to it.
@@ -1039,8 +1065,10 @@ def build_hosts(domains, meta, software_rows=None, cert_rows=None, dns_results=N
                 | {r.get("host") for r in software_rows}) - {None, ""}
     domains = [str(d).strip().lower().rstrip(".") for d in (domains or []) if str(d).strip()]
     cards, claimed = [], set()
-    for dom in domains:
-        mine = sorted(h for h in observed if h not in claimed and hosts_for_domain(dom, h))
+    groups = [(dom, sorted(h for h in observed if hosts_for_domain(dom, h))) for dom in domains]
+    groups += _range_groups(meta, observed)
+    for dom, members in groups:
+        mine = [h for h in members if h not in claimed]
         claimed.update(mine)
         for h in mine:
             if only and h != only:
@@ -1064,7 +1092,7 @@ def build_hosts(domains, meta, software_rows=None, cert_rows=None, dns_results=N
                 # CDN seen there is still critical exposure
                 card["critical_exposure"] = any(
                     d["type"] in _CRITICAL_TYPES for p in card["pillars"] for d in p["deductions"])
-            card.update(host=h, parent=dom)
+            card.update(host=h, parent=dom, kind="range" if "/" in dom else "domain")
             cards.append(card)
     # critical exposure first (rated hosts with it are capped at 60 anyway),
     # then weakest score; hosts too thin to rate come last

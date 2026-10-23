@@ -835,6 +835,7 @@ def api_org_get(slug: str, req: Request = None):
     if stored is None:
         stored = org.get("ai_profile")
     return {"slug": slug, "name": org.get("name"), "domains": org.get("domains", []),
+            "ip_ranges": org.get("ip_ranges") or [],
             "ai_profile": stored,
             "effective_ai_profile": effective,
             "ai_capabilities": caps,
@@ -1265,6 +1266,7 @@ class RegisterOrg(BaseModel):
     slug: str
     name: str = ""
     domains: list = []
+    ip_ranges: list = []
     ai_profile: str = ""
 
 
@@ -1296,6 +1298,9 @@ def api_org_register(body: RegisterOrg, req: Request):
         return JSONResponse({"error": "too many domains (max 20)"}, status_code=400)
     if body.domains and not domains:
         return JSONResponse({"error": "no valid domains (strict DNS name required)"}, status_code=400)
+    ip_ranges, range_err = _scanner.normalize_ip_ranges(body.ip_ranges or [])
+    if range_err:
+        return JSONResponse({"error": range_err}, status_code=400)
     # validate ai_profile before any filesystem mutation
     ai_profile = str(getattr(body, "ai_profile", "") or "").strip()
     profiles, _ = ai_providers.load_profiles()
@@ -1321,6 +1326,7 @@ def api_org_register(body: RegisterOrg, req: Request):
         registry[slug] = {
             "name": name,
             "domains": domains,
+            "ip_ranges": ip_ranges,
             "findings": f"data/orgs/{slug}/findings.json",
             "baseline": f"data/orgs/{slug}/baseline.txt",
         }
@@ -1339,8 +1345,10 @@ def api_org_register(body: RegisterOrg, req: Request):
     if ai_profile:
         ai_providers.set_org_profile(slug, ai_profile)
 
-    _log_event("info", "system", slug, f"workspace registered ({name}, {len(domains)} domain(s))")
-    return {"slug": slug, "name": name, "domains": domains, "ai_profile": ai_profile or None}
+    _log_event("info", "system", slug, f"workspace registered ({name}, {len(domains)} domain(s), "
+                                         f"{len(ip_ranges)} IP range(s))")
+    return {"slug": slug, "name": name, "domains": domains, "ip_ranges": ip_ranges,
+            "ai_profile": ai_profile or None}
 
 
 class RenameOrgBody(BaseModel):
@@ -1444,6 +1452,73 @@ def api_org_domains(slug: str, body: DomainsBody, req: Request):
     _log_event("info", "system", slug,
                f"domains updated ({action}): {', '.join(new_domains) or '(none)'}")
     return {"slug": slug, "domains": new_domains}
+
+
+class IpRangesBody(BaseModel):
+    ranges: list = []
+    action: str = "add"
+
+
+@app.post("/api/orgs/{slug}/ip_ranges")
+def api_org_ip_ranges(slug: str, body: IpRangesBody, req: Request):
+    """Add / remove / replace IPv4 ranges scanned alongside the org's domains.
+
+    Each entry is a public IPv4 CIDR block (a bare IP is a /32); the org's
+    ranges together may cover at most CTI_MAX_RANGE_IPS addresses (default
+    2048, one /21; ceiling 65536).
+    """
+    if not _auth_ok(req):
+        return JSONResponse({"error": "unauthorized: missing or bad credentials (username/password)"},
+                            status_code=401)
+    if not _valid_slug(slug):
+        return JSONResponse({"error": "invalid slug"}, status_code=400)
+    if cc.org_get(slug) is None:
+        return _org_not_found(slug)
+    action = str(getattr(body, "action", "add") or "add").strip().lower()
+    if action not in ("add", "remove", "set"):
+        return JSONResponse({"error": "invalid action (add|remove|set)"}, status_code=400)
+    import scanner as _scanner
+    given = []
+    for r in body.ranges or []:
+        cidr, err = _scanner.parse_ip_range(r)
+        if err:
+            # removing must still work for an entry that no longer validates
+            if action == "remove":
+                given.append(str(r).strip())
+                continue
+            return JSONResponse({"error": err}, status_code=400)
+        given.append(cidr)
+    if not given and action != "set":
+        return JSONResponse({"error": "no ranges given"}, status_code=400)
+
+    with _registry_lock:
+        try:
+            with open(ORGS_JSON) as f:
+                registry = json.load(f)
+            if not isinstance(registry, dict):
+                raise ValueError("invalid registry")
+        except (OSError, ValueError):
+            return JSONResponse({"error": "registry corrupted, aborting"}, status_code=500)
+        entry = registry.get(slug)
+        if not isinstance(entry, dict):
+            return _org_not_found(slug)
+        cur = [str(r).strip() for r in (entry.get("ip_ranges") or []) if str(r).strip()]
+        if action == "add":
+            wanted = cur + given
+        elif action == "remove":
+            wanted = [r for r in cur if r not in given]
+        else:
+            wanted = given
+        new_ranges, err = _scanner.normalize_ip_ranges(wanted)
+        if err:
+            return JSONResponse({"error": err}, status_code=400)
+        entry["ip_ranges"] = new_ranges
+        cc._atomic_write_json(ORGS_JSON, registry)
+    cc._reload_registry()
+    _log_event("info", "system", slug,
+               f"IP ranges updated ({action}): {', '.join(new_ranges) or '(none)'}")
+    return {"slug": slug, "ip_ranges": new_ranges,
+            "addresses": len(_scanner.expand_ip_ranges(new_ranges))}
 
 
 class ScanBody(BaseModel):
