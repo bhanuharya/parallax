@@ -1,5 +1,18 @@
 # Handoff — Asset Inventory & Scorecard Cycle
 
+## Public data and docs (2026-10-23, late)
+
+- **Real data removed from the public repo:** `data/orgs.json` on `main` had
+  two real client orgs (one with OpenHack enabled) since commit `8e16865`.
+  Restored to the sample org via the existing unmerged fix (`75063e9`) and
+  guarded by `tests/test_public_repo_data.py` (tracked registries may only
+  use reserved example domains; scan output must stay ignored). The names
+  remain in git history; rewriting it is the owner's call.
+- **Docs:** README gained a dark hero screenshot, a Python quick start with a
+  persistent `CTI_DATA_DIR`, env rows for the Python-only features, and a
+  Screens gallery (`screenshots/parallax-*.png`, fictional `acme.example`
+  demo, 256-colour PNGs). The old CTI Radar JPEGs were removed.
+
 ## Merge of origin/main (2026-10-23)
 
 `feat/parallax-platform` merges `origin/main` (Rust rewrite, AI-config CRUD,

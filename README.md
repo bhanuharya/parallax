@@ -23,6 +23,8 @@ it, and compare organizations side by side.
 > **Onboarding an agent or engineer?** Read [HANDOFF.md](HANDOFF.md) — current
 > cycle state, the scanner traps that will bite you, and the open backlog.
 
+![Parallax overview: rating with trend, risk factors and what to fix first](screenshots/parallax-overview-dark.png)
+
 > **Two backends.** The FastAPI app under `app/` has the full feature set,
 > including everything Parallax adds: the posture rating, host ratings, the
 > what-if planner, packages & dependencies, live CVE intel, the AI assistant
@@ -40,6 +42,35 @@ it, and compare organizations side by side.
 > deny-by-default and gated behind `CTI_VULN_*` / `CTI_OPENHACK_*`
 > authorization. Use it only on infrastructure you own or are explicitly
 > authorized to test.
+
+---
+
+## Quick start (full feature set)
+
+The posture features run on the Python backend. Keep scan data in a folder
+outside the checkout; the tracked `data/orgs.json` is a public sample.
+
+```bash
+git clone https://github.com/bhanuharya/cti-radar.git && cd cti-radar
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+mkdir -p ~/.local/share/cti-radar
+
+CTI_DATA_DIR=~/.local/share/cti-radar \
+CTI_USER=admin CTI_PASSWORD='a-long-random-password' \
+CTI_SCAN_TOKEN='another-long-random-string' \
+.venv/bin/python app/main.py          # http://127.0.0.1:8084
+```
+
+1. Sign in, choose **New org**, and add domains you own or are authorized to
+   assess.
+2. **Run scan**. The overview fills with the rating, risk factors, hosts,
+   packages and the fix-first list.
+3. Optional: set `CTI_CVE_NOW=1` for live advisories (sends package names and
+   versions only), and connect an AI provider for the assistant: an
+   `OPENCODE_GO_API_KEY`, `OPENCODE_API_KEY` or `DEEPSEEK_API_KEY`, or
+   `codex login --device-auth` to use a ChatGPT plan through Codex.
+
+The [Screens](#screens) section shows each view with demo data.
 
 ---
 
@@ -399,6 +430,9 @@ reverse proxy in front for TLS. All state lives under `CTI_DATA_DIR`.
 | `CTI_VULN_ACTIVE` / `CTI_VULN_ISOLATED` / `CTI_VULN_ALLOWED_DOMAINS` / `CTI_VULN_ROE_EXPIRES` | active vuln-lookup gate (all four required, deny-by-default) |
 | `CTI_NUCLEI_BIN` / `CTI_NUCLEI_TEMPLATES` / `CTI_NUCLEI_SEVERITY` / `CTI_NUCLEI_TAGS` / `CTI_NUCLEI_EXCLUDE_TAGS` / `CTI_NUCLEI_RATE_LIMIT` / `CTI_NUCLEI_TIMEOUT` / `CTI_NUCLEI_INTERACTSH` | Nuclei engine tuning (see `.env.example`) |
 | `CTI_OPENHACK_ACTIVE` / `CTI_OPENHACK_ISOLATED` / `CTI_OPENHACK_ALLOWED_DOMAINS` / `CTI_OPENHACK_ROE_EXPIRES` | OpenHack active-assessment gate |
+| `CTI_CVE_NOW` / `CTI_CVE_NOW_TTL` / `CTI_CVE_NOW_MAX_PACKAGES` / `CTI_CVE_NOW_MAX_LOOKUPS` | live cve.now advisories, opt-in (Python backend) |
+| `OPENCODE_GO_API_KEY` / `OPENCODE_API_KEY` / `DEEPSEEK_API_KEY` / `CTI_CODEX_BIN` | AI assistant providers; Codex uses `codex login` (Python backend) |
+| `CTI_ASSET_CAP` | scripts/stylesheets kept per host for the dependency inventory (Python backend) |
 
 ## API surface
 
@@ -622,18 +656,40 @@ features exist only here so far; porting them to Rust is open work. New
 backend work should target the Rust implementation where it can;
 `rust/PORT.md` documents the module map and API contract between the two.
 
-## Preview
+## Screens
 
-Screenshots below show the **previous (CTI Radar) interface** and have not
-been retaken since the redesign:
+All screenshots use a fictional demo workspace (`acme.example`).
 
-![Previous CTI Radar dashboard 1](screenshots/cti-radar-01.jpeg)
+**Overview**: the rating with its trend, the seven risk factors, what to fix
+first with the exact rating gain, vulnerable packages, script drift, and
+every domain.
 
-![Previous CTI Radar dashboard 2](screenshots/cti-radar-02.jpeg)
+![Overview](screenshots/parallax-overview.png)
 
-![Previous CTI Radar dashboard 3](screenshots/cti-radar-03.jpeg)
+**Packages & dependencies**: a known-exploited jQuery with its CISA KEV due
+date, fixed version, and the exact asset URL it was seen in; third-party
+script origins and a drift alert for a newly added compromised CDN.
 
-![Previous CTI Radar dashboard 4](screenshots/cti-radar-04.jpeg)
+![Packages and dependencies](screenshots/parallax-packages.png)
+
+**Issues & planner**: select issue types to see the projected rating,
+computed by re-running the model.
+
+![Issues and planner](screenshots/parallax-issues.png)
+
+**Hosts**: every subdomain scored on its own evidence, critical exposure
+first.
+
+![Hosts](screenshots/parallax-hosts.png)
+
+**AI assistant**: answers from read-only tools, with every cited id checked
+against the evidence.
+
+![AI assistant](screenshots/parallax-assistant.png)
+
+**Portfolio**: every organization side by side.
+
+![Portfolio](screenshots/parallax-portfolio.png)
 
 ## License & use
 
