@@ -62,7 +62,7 @@ def test_vulnerability_pillar_scores_critical_higher():
 def test_vulnerability_pillar_capped():
     rows = [_sw(host="h%d.example.com" % i) for i in range(20)]
     v = sc.vulnerability_pillar(rows, SEV)
-    assert v["earned"] >= sc.WEIGHTS["vulnerability"] - sc._CVE_POINTS_MAX
+    assert v["score"] == 100 - sc._CVE_POINTS_MAX
 
 
 def test_unknown_cve_severity_treated_as_medium_not_critical():
@@ -139,10 +139,18 @@ GOOD_SVC = [{"host": "h.example.com", "open": {"443": "https"}}]
 # vulnerability pillar is genuinely ASSESSED and clean
 GOOD_SW = [{"host": "h.example.com", "product": "nginx", "version": "1.27.0",
             "cve_count": 0, "related_cves": []}]
+# a web response carrying every header the application and disclosure
+# factors look for, so both are assessed and clean
+GOOD_WEB = [{"host": "h.example.com", "url": "https://h.example.com", "code": "200",
+             "server": "nginx", "strict-transport-security": "max-age=31536000",
+             "content-security-policy": "default-src 'self'",
+             "x-frame-options": "DENY", "x-content-type-options": "nosniff",
+             "assets": []}]
 
 
 def test_perfect_domain_scores_a():
-    c = sc.scorecard_for_domain("example.com", GOOD_SW, GOOD_CERT, GOOD_DNS, GOOD_SVC)
+    c = sc.scorecard_for_domain("example.com", GOOD_SW, GOOD_CERT, GOOD_DNS, GOOD_SVC,
+                                web_rows=GOOD_WEB)
     assert c["score"] == 100
     assert c["grade"] == "A"
     assert c["coverage"] == 100
@@ -170,8 +178,10 @@ def test_never_examined_is_zero_and_unknown():
 def test_missing_pillar_does_not_earn_clean_credit():
     """The central rule: a pillar with no data is excluded from the average,
     but the RESULTING grade is capped because the evidence is partial."""
-    full = sc.scorecard_for_domain("e.com", GOOD_SW, GOOD_CERT, GOOD_DNS, GOOD_SVC)
-    partial = sc.scorecard_for_domain("e.com", GOOD_SW, GOOD_CERT, GOOD_DNS, None)
+    full = sc.scorecard_for_domain("e.com", GOOD_SW, GOOD_CERT, GOOD_DNS, GOOD_SVC,
+                                   web_rows=GOOD_WEB)
+    partial = sc.scorecard_for_domain("e.com", GOOD_SW, GOOD_CERT, GOOD_DNS, None,
+                                      web_rows=GOOD_WEB)
     assert full["grade"] == "A"
     assert partial["coverage"] < 100
     assert partial["grade"] != "A"
@@ -180,23 +190,24 @@ def test_missing_pillar_does_not_earn_clean_credit():
 
 def test_unfingerprinted_domain_is_not_clean_vulnerability():
     looked = sc.scorecard_for_domain("e.com", GOOD_SW, GOOD_CERT, GOOD_DNS, GOOD_SVC,
-                                     software_assessed=True)
+                                     software_assessed=True, web_rows=GOOD_WEB)
     never = sc.scorecard_for_domain("e.com", [], GOOD_CERT, GOOD_DNS, GOOD_SVC,
-                                    software_assessed=False)
+                                    software_assessed=False, web_rows=GOOD_WEB)
     assert looked["coverage"] == 100 and looked["grade"] == "A"
     assert never["coverage"] < 100
     assert never["coverage_cap"] is True
     assert never["grade"] != "A"
 
 
-def test_issues_sorted_by_points():
+def test_issues_sorted_by_gain():
     c = sc.scorecard_for_domain(
         "example.com",
         [_sw(cves=("CVE-2017-1001000",))],
         [{"host": "h.example.com", "issues": ["expiring soon"]}],
-        GOOD_DNS, GOOD_SVC, SEV)
-    pts = [i["points"] for i in c["issues"]]
-    assert pts == sorted(pts, reverse=True)
+        GOOD_DNS, GOOD_SVC, SEV, web_rows=GOOD_WEB)
+    gains = [i["gain"] for i in c["issues"]]
+    assert gains == sorted(gains, reverse=True)
+    assert c["issues"][0]["type"] == "vuln-critical"
 
 
 def test_every_deduction_has_code_and_points():
@@ -227,21 +238,25 @@ def test_build_does_not_double_count_overlapping_domains():
     its CVEs would count twice and both cards would look worse than reality."""
     sw = [{"host": "www.example.com", "product": "wordpress", "version": "4.7.1",
            "cve_count": 1, "related_cves": ["CVE-2017-1001000"]}]
-    meta = {"fingerprints": {"www.example.com": {}}, "services": {}}
+    # a service scan as well, so the cards clear the 30% coverage floor
+    meta = {"fingerprints": {"www.example.com": {}},
+            "services": {"www.example.com": {"open": {"443": "https"}}}}
     cards = sc.build(["example.com", "www.example.com"], meta,
                      software_rows=sw, severity_map=SEV)
     scored = [c for c in cards if c["issues"]]
     assert len(scored) == 1
     total = sum(i["points"] for c in cards for i in c["issues"])
     once = sum(i["points"] for i in sc.scorecard_for_domain(
-        "example.com", sw, [], None, None, SEV)["issues"])
+        "example.com", sw, [], None,
+        [{"host": "www.example.com", "open": {"443": "https"}}], SEV)["issues"])
+    assert once > 0
     assert total == once
 
 
 def test_build_attributes_by_subdomain():
     sw = [{"host": "api.example.com", "product": "django", "version": "3.2.4",
            "cve_count": 1, "related_cves": ["CVE-2022-28346"]}]
-    meta = {"services": {}}
+    meta = {"services": {"api.example.com": {"open": {}}}}
     sev = {"CVE-2022-28346": "HIGH"}
     cards = {c["domain"]: c for c in
              sc.build(["example.com", "other.com"], meta,
@@ -251,7 +266,8 @@ def test_build_attributes_by_subdomain():
 
 
 def test_summarize_rollup():
-    good = sc.scorecard_for_domain("a.com", GOOD_SW, GOOD_CERT, GOOD_DNS, GOOD_SVC)
+    good = sc.scorecard_for_domain("a.com", GOOD_SW, GOOD_CERT, GOOD_DNS, GOOD_SVC,
+                                   web_rows=GOOD_WEB)
     bad = sc.scorecard_for_domain(
         "b.com", [_sw(host="h.b.com", cves=("CVE-2017-1001000",))],
         [{"host": "h.b.com", "issues": ["expired"]}], GOOD_DNS, GOOD_SVC, SEV)
@@ -271,7 +287,8 @@ def test_summarize_handles_unknown_domains():
 def test_header_grade_never_exceeds_card_grade():
     """A card capped to C for partial coverage must not average back up into a
     B in the header — the top line cannot contradict the cards beneath it."""
-    partial = sc.scorecard_for_domain("e.com", GOOD_SW, GOOD_CERT, GOOD_DNS, None)
+    partial = sc.scorecard_for_domain("e.com", GOOD_SW, GOOD_CERT, GOOD_DNS, None,
+                                      web_rows=GOOD_WEB)
     assert partial["score"] == 100
     assert partial["grade"] == "C" and partial["coverage_cap"] is True
     s = sc.summarize([partial])

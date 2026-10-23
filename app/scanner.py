@@ -26,6 +26,8 @@ from collections import Counter, defaultdict
 import cti_correlation as cc
 import ai_providers
 import cve_match
+import dependencies
+import live_cve
 import tech_detect
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -75,6 +77,7 @@ DNS_TAKEOVER_HOST_CAP = _env_int("CTI_DNS_TAKEOVER_HOSTS", 25)  # CNAME probes p
 
 # --- framework detection ---
 TECH_DETECT_CAP = _env_int("CTI_TECH_DETECT_CAP", 16)      # detections kept per host
+ASSET_CAP = _env_int("CTI_ASSET_CAP", 30)                  # script/style assets kept per host
 
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(\.(?!-)[A-Za-z0-9-]{1,63})+$")
 
@@ -532,7 +535,7 @@ _TECH_SIGNATURES = (
     ("citrix / netscaler", re.compile(r"citrix|netscaler|LogonPoint|Receiver for", re.I)),
     ("palo alto globalprotect", re.compile(r"globalprotect", re.I)),
     ("cisco asa / anyconnect", re.compile(r"\+CSCOE\+|anyconnect|webvpn", re.I)),
-    ("f5 big-ip", re.compile(r"F5|BIG-IP|bigipwebdav|/my.policy", re.I)),
+    ("f5 big-ip", re.compile(r"bigipwebdav|(?:action|href)=[\"']/my\.policy(?:[?\"'])", re.I)),
     ("pulse secure / ivanti", re.compile(r"pulse secure|pulsesecure|ivanti|dana-na", re.I)),
     ("sonicwall", re.compile(r"sonicwall|sslvpn", re.I)),
     ("zimbra", re.compile(r"zimbra", re.I)),
@@ -540,7 +543,7 @@ _TECH_SIGNATURES = (
     ("confluence", re.compile(r"confluence", re.I)),
     ("tomcat", re.compile(r"apache tomcat", re.I)),
     ("phpmyadmin", re.compile(r"phpmyadmin|pma_absolute_uri", re.I)),
-    ("vmware horizon", re.compile(r"horizon|view client|blast", re.I)),
+    ("vmware horizon", re.compile(r"(?:src|href)=[\"'][^\"']*/portal/webclient/|VMware\s+Horizon\s+(?:Client|HTML\s+Access)", re.I)),
     ("microsoft iis", re.compile(r"asp\.net|\.aspx|x-powered-by: asp\.net", re.I)),
 )
 _META_GENERATOR_RE = re.compile(r"<meta[^>]+name=[\"']generator[\"'][^>]+content=[\"']([^\"']+)[\"']", re.I)
@@ -793,7 +796,11 @@ def _fetch_fingerprint(host, timeout=8, ips=None):
     resolve_args = _resolve_args(host, ips)
     for scheme in ("https", "http"):
         try:
-            cmd = ["curl", "-s", "-m", str(timeout),
+            # --insecure: this request only OBSERVES the page. Certificate
+            # validity is judged separately by _tls_cert; refusing an expired
+            # or mismatched certificate here would drop the host to plain
+            # HTTP and misreport it as "served without HTTPS".
+            cmd = ["curl", "-s", "--insecure", "-m", str(timeout),
                    "--max-filesize", str(CURL_MAX_BYTES),
                    "--noproxy", "*", "--max-redirs", "0",
                    "-D", "-", "-o", "-"] + resolve_args + [f"{scheme}://{host}/"]
@@ -875,6 +882,20 @@ def _fetch_fingerprint(host, timeout=8, ips=None):
                             versions.append(pv)
             except Exception as e:
                 _log("debug", f"tech detect failed for {host}: {type(e).__name__}: {e}")
+            # --- outside-in dependencies ---
+            # Scripts and stylesheets the page loads, from the markup already
+            # in hand (no asset is fetched). `assets` is present only when a
+            # document body was examined, so an empty list means "looked,
+            # none" and absence means "not examined".
+            try:
+                if code.startswith("2") and re.search(r"<(?:html|head|script|link)\b", body_head, re.I):
+                    assets = dependencies.extract_assets(body_head, snippet["url"], cap=ASSET_CAP)
+                    snippet["assets"] = assets
+                    for pv in dependencies.as_versions(assets):
+                        if pv not in versions:
+                            versions.append(pv)
+            except Exception as e:
+                _log("debug", f"dependency extraction failed for {host}: {type(e).__name__}: {e}")
             if versions:
                 snippet["versions"] = versions
             return probe, snippet
@@ -1229,6 +1250,20 @@ def record_scan_event(slug, mode, fingerprint_len, summary=None, note=""):
         },
         "note": note or "",
     }
+    if ev["kind"] == "scan":
+        # Use the exact file snapshot read above, outside the non-reentrant
+        # org lock. Correlation and AI-only events never become scan points.
+        try:
+            ev["posture"] = cc.scorecard_from_snapshot(
+                (cc.REGISTRY.get(slug) or {}).get("domains") or [],
+                d.get("meta") or {}, d.get("findings") or [], explain=False)["snapshot"]
+        except Exception as e:
+            _log("warn", f"score history unavailable for {slug}: {type(e).__name__}: {e}")
+        try:
+            ev["dependencies"] = cc.dependency_snapshot(
+                d.get("meta") or {}, (cc.REGISTRY.get(slug) or {}).get("domains") or [])
+        except Exception as e:
+            _log("warn", f"dependency history unavailable for {slug}: {type(e).__name__}: {e}")
     return append_history(slug, ev)
 
 
@@ -2380,7 +2415,7 @@ def synthesize_surface_findings(slug, snippets, reached, services=None, enumerat
                 seq += 1
                 cat = infra_cat or "Internet-facing service"
                 sev = infra_sev or "INFO"
-                evidence = dict(s)
+                evidence = {k: v for k, v in s.items() if k != "assets"}
                 evidence["port"] = wport
                 if open_ports:
                     evidence["services"] = open_ports   # informational: full port map
@@ -3003,7 +3038,9 @@ def _refresh_finding_evidence(fs, snippets, services):
         for k in stale_keys:
             ev.pop(k, None)
         if isinstance(s, dict):
-            ev.update(s)
+            # the asset list belongs to the dependency inventory, not to
+            # every finding on the host
+            ev.update({k: v for k, v in s.items() if k != "assets"})
         open_ports = svc.get("open") or {}
         banners = svc.get("banners") or {}
         if per_port is not None:
@@ -3308,10 +3345,11 @@ def synthesize_cve_findings(slug, snippets, nvd=None):
         if key in existing_keys:
             continue
         seq += 1
-        # map CVEs are all >= 7.0; cap at HIGH and downgrade when the observed
-        # version carries too little information (single numeric component)
+        # Cap severe advisory matches at HIGH; never promote a moderate/low
+        # advisory. Sparse version evidence downgrades high matches further.
         conf = cve_match.worst_confidence(matches)
-        sev = "HIGH" if conf == "medium" else "MEDIUM"
+        worst = min((m["severity"] for m in matches), key=lambda s: cc._SEV_ORDER.get(s, 9))
+        sev = ("HIGH" if conf == "medium" else "MEDIUM") if worst in ("CRITICAL", "HIGH") else worst
         cves = [m["cve"] for m in matches]
         ver_txt = ", ".join("%s %s" % (m["product"], m["version"]) for m in matches[:4])
         ev = {k: s[k] for k in ("url", "code", "server", "x-powered-by", "title")
@@ -3350,7 +3388,7 @@ def synthesize_cve_findings(slug, snippets, nvd=None):
             "mode": "fast",
             "source": "scan-cve",
             "description": "Disclosed software versions on %s (%s) match %d "
-                           "high-impact CVE(s) in the local advisory map: %s."
+                           "CVE(s) in the local advisory map: %s."
                            % (h, ver_txt, len(matches),
                               ", ".join(cves[:6])),
             "impact": "If the affected configuration is in use, the host may be "
@@ -3880,10 +3918,11 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
     _stage_done("services")
 
     # --- TLS certificate inspection: keyed off TCP reachability of TLS ports,
-    # NOT off HTTPS-fingerprint success. curl (without --insecure) fails the
-    # HTTPS fetch precisely when a cert is expired/self-signed/hostname-
-    # mismatched, so gating on the https:// snippet skipped exactly the hosts
-    # whose certs needed review. The service probe proves 443/8443 reachability
+    # NOT off HTTPS-fingerprint success. The fingerprint fetch can still fail
+    # on TLS (handshake errors, non-HTTP services, timeouts), and before it
+    # used --insecure it failed precisely on expired/self-signed/mismatched
+    # certs, so gating on the https:// snippet skipped exactly the hosts whose
+    # certs needed review. The service probe proves 443/8443 reachability
     # independently of cert validity.
     if service_candidates:
         tls_hosts = []
@@ -3961,6 +4000,20 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
             _log("warn", f"NVD enrichment failed for {slug}: "
                          f"{type(e).__name__}: {e}")
     _stage_done("nvd")
+
+    # --- optional live advisories from cve.now (CTI_CVE_NOW=1) ---
+    # Same contract as NVD enrichment: network outside the org lock,
+    # fail-open, captured into scan meta so the rating stays a function of
+    # this snapshot. Only package names/versions and CVE ids are sent.
+    live_cves = None
+    if live_cve.enabled() and snippets:
+        _emit(on_progress, "capture", "live advisories (cve.now)")
+        live_cves = live_cve.collect(snippets)
+        _emit(on_progress, "capture",
+              f"cve.now: {len(live_cves['cves'])} advisories for "
+              f"{len(live_cves['packages'])} package(s)"
+              + ("" if live_cves["complete"] else " (partial)"))
+    _stage_done("live_cve")
 
     # --- findings.json: preserve existing findings, merge scan meta atomically ---
     # baseline.txt is written inside the same org lock as findings.json so a
@@ -4057,6 +4110,10 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
                 # DNS / email-authentication posture per registered domain
                 # (SPF, DMARC, DKIM, DNSSEC, CAA, MTA-STS + takeover checks)
                 "dns_posture": dns_results,
+                # live advisories captured for this snapshot (None when the
+                # cve.now source is off, so a previous scan's intel never
+                # outlives the evidence it was fetched for)
+                "live_cves": live_cves,
                 # reconciliation bookkeeping for this scan
                 "reconcile": {
                     "observed": recon.get("observed", 0),

@@ -384,7 +384,28 @@ def evaluate_domain(domain, snapshot):
 
     score, grade = _grade(checks, issues)
     return {"domain": domain, "grade": grade, "score": score,
-            "checks": checks, "issues": issues}
+            "checks": checks, "issues": issues,
+            "records": _provider_records(snapshot)}
+
+
+def _provider_records(snapshot):
+    """Bounded copy of the public records that reveal service providers.
+
+    Kept raw (not pre-classified) so the provider table in dependencies.py
+    can improve without a rescan. A failed lookup stays None.
+    """
+    def _cap(values, n=20):
+        if values is None:
+            return None
+        return [str(v)[:255] for v in values[:n]]
+    return {
+        "mx": _cap(snapshot.get("mx")),
+        "ns": _cap(snapshot.get("ns")),
+        "txt": _cap(snapshot.get("txt")),
+        "cname_targets": [{"host": str(c.get("host", ""))[:255], "cname": str(c.get("cname", ""))[:255]}
+                          for c in (snapshot.get("cname_targets") or [])[:50]
+                          if isinstance(c, dict)],
+    }
 
 
 _DKIM_P_RE = re.compile(r"p\s*=\s*([^;]*)", re.I)
@@ -454,6 +475,28 @@ def _analyze_mta_sts(txt_values):
             "severity": "LOW"}
 
 
+CHECK_WEIGHTS = {"dmarc": 30, "spf": 25, "dkim": 15, "dnssec": 10,
+                 "caa": 10, "mta_sts": 10}
+
+
+def check_credit(check):
+    """Share of a check's weight it earns, or None when it is unknown.
+
+    Shared with the scorecard so its per-check attribution can never drift
+    from the posture score it explains.
+    """
+    check = check or {}
+    if check.get("unknown"):
+        return None
+    if check.get("missing"):
+        return 0.0
+    sev = check.get("severity")
+    if sev is None or sev == "INFO":
+        return 1.0
+    # HIGH and above earns nothing
+    return {"LOW": 0.6, "MEDIUM": 0.3}.get(sev, 0.0)
+
+
 def _grade(checks, issues):
     """Deterministic 0-100 posture score and A-F grade, or (0, '?') when no
     check could be determined.
@@ -467,25 +510,14 @@ def _grade(checks, issues):
       - INFO: full credit — context, never a deficiency.
     Any dangling-CNAME takeover caps the score at 40% of possible.
     """
-    weights = {"dmarc": 30, "spf": 25, "dkim": 15, "dnssec": 10,
-               "caa": 10, "mta_sts": 10}
     earned = 0.0
     possible = 0
-    for name, weight in weights.items():
-        c = checks.get(name, {})
-        if c.get("unknown"):
+    for name, weight in CHECK_WEIGHTS.items():
+        credit = check_credit(checks.get(name, {}))
+        if credit is None:
             continue
         possible += weight
-        if c.get("missing"):
-            continue
-        sev = c.get("severity")
-        if sev is None or sev == "INFO":
-            earned += weight
-        elif sev == "LOW":
-            earned += weight * 0.6
-        elif sev == "MEDIUM":
-            earned += weight * 0.3
-        # HIGH and above earns nothing
+        earned += weight * credit
     if possible <= 0:
         return 0, "?"
     if checks.get("takeover"):
@@ -620,6 +652,9 @@ def gather(domain, hosts=None, max_cname_hosts=25):
     snapshot["dmarc_txt"] = _query("_dmarc." + domain, "TXT")
     snapshot["mta_sts_txt"] = _query("_mta-sts." + domain, "TXT")
     snapshot["caa"] = _query(domain, "CAA")
+    # mail and DNS-hosting providers, for the outside-in dependency inventory
+    snapshot["mx"] = _query(domain, "MX")
+    snapshot["ns"] = _query(domain, "NS")
 
     dkim = {}
     for sel in COMMON_DKIM_SELECTORS:
@@ -641,6 +676,7 @@ def gather(domain, hosts=None, max_cname_hosts=25):
     snapshot["dnssec_validated"] = bool(dnskey and ds) if dnskey is not None else None
 
     cnames = []
+    cname_targets = []
     seen = set()
     for host in (hosts or [])[:max_cname_hosts]:
         host = str(host or "").strip().lower().rstrip(".")
@@ -654,6 +690,8 @@ def gather(domain, hosts=None, max_cname_hosts=25):
         if not recs:
             continue
         target = str(recs[0]).strip().rstrip(".")
+        if target:
+            cname_targets.append({"host": host, "cname": target})
         if not target or not matching_takeover_provider(target):
             continue
         cnames.append({
@@ -663,6 +701,7 @@ def gather(domain, hosts=None, max_cname_hosts=25):
             "had_dns_answer": True,
         })
     snapshot["cnames"] = cnames
+    snapshot["cname_targets"] = cname_targets
     return snapshot
 
 

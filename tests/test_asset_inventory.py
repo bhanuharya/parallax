@@ -183,8 +183,8 @@ def test_software_inventory_joins_cves():
     ]
     rows = cc.software_from_meta(meta, findings)
     by_host = {r["host"]: r for r in rows}
-    # app: CVE comes from the existing finding (and matches the map too)
-    assert by_host["app.example.com"]["cve_count"] == 1
+    # nginx 1.20.1 is fixed. An older finding cannot override its current version.
+    assert by_host["app.example.com"]["cve_count"] == 0
     assert by_host["app.example.com"]["finding_id"] == "CVM-1"
     # api: Apache 2.4.49 is genuinely vulnerable, resolved straight from the
     # CVE map even though no scan-cve finding exists for it
@@ -194,7 +194,7 @@ def test_software_inventory_joins_cves():
     summary = cc.software_summary(rows)
     assert summary["total"] == 2
     assert summary["hosts"] == 2
-    assert summary["vulnerable"] == 2
+    assert summary["vulnerable"] == 1
 
 
 def test_software_inventory_lists_multiple_products_per_host():
@@ -315,13 +315,13 @@ def test_expanded_cve_map_clears_fixed_versions(product, version):
 
 
 def test_cve_map_entries_are_wellformed():
-    """Every entry has a valid CVE id, CRITICAL/HIGH severity and ranges."""
+    """Every entry has a valid CVE id, recognized severity and ranges."""
     import re
     products = cve_match.load_map()
     for key, entry in products.items():
         for cve in entry.get("cves", []):
             assert re.fullmatch(r"CVE-\d{4}-\d{4,7}", cve["cve"]), cve
-            assert cve["severity"] in ("CRITICAL", "HIGH"), cve
+            assert cve["severity"] in ("CRITICAL", "HIGH", "MEDIUM", "LOW"), cve
             assert cve.get("ranges"), cve
             assert cve.get("summary"), cve
 

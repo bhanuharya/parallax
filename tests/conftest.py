@@ -25,6 +25,11 @@ os.environ["CTI_STATE_DIR"] = _TEST_STATE_ROOT
 os.environ["CTI_SCAN_TOKEN"] = "test-tok"
 os.environ["CTI_USER"] = "testuser"
 os.environ["CTI_PASSWORD"] = "testpass"
+# AI presets appear when a provider credential or the Codex CLI is present on
+# the machine; keep the suite independent of the developer's setup.
+os.environ["CTI_CODEX_BIN"] = os.path.join(tempfile.gettempdir(), "no-such-codex-binary")
+for _key in ("OPENCODE_GO_API_KEY", "OPENCODE_GO_B_API_KEY", "OPENCODE_API_KEY", "DEEPSEEK_API_KEY"):
+    os.environ.pop(_key, None)
 
 _sample_dir = os.path.join(_TEST_DATA_ROOT, "orgs", "sample")
 os.makedirs(_sample_dir, exist_ok=True)

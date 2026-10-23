@@ -51,7 +51,7 @@ _SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 _CHROMIUM = (os.environ.get("CTI_CHROMIUM_PATH") or shutil.which("chromium")
              or shutil.which("chromium-browser") or shutil.which("google-chrome"))
 
-app = FastAPI(title="CTI Radar", docs_url=None, redoc_url=None)
+app = FastAPI(title="Parallax", docs_url=None, redoc_url=None)
 
 # tighten runtime data permissions once at startup (0600 files / 0700 dirs);
 # best-effort, never blocks boot
@@ -315,7 +315,11 @@ def _login_limit(ip):
                 _LOGIN_FAILS.pop(key, None)
         vals = _LOGIN_FAILS.get(ip, [])
         if len(vals) >= threshold:
-            return True, retry
+            # The IP unlocks only once fewer than threshold failures remain.
+            # A fixed short retry hint otherwise sends users into more 429s.
+            import math
+            remaining = math.ceil(vals[len(vals) - threshold] + window - now)
+            return True, max(retry, remaining, 1)
     return False, retry
 
 def _record_login_failure(ip):
@@ -589,13 +593,102 @@ def api_dns_posture(org: str = _DEFAULT_ORG, req: Request = None):
     return cc.dns_posture(org)
 
 
-@app.get("/api/scorecard")
+@app.get("/api/posture")
+@app.get("/api/scorecard")   # original name, kept for existing clients
 def api_scorecard(org: str = _DEFAULT_ORG, req: Request = None):
-    """Per-domain composite scorecard with itemized deductions and coverage."""
+    """External posture rating: per-domain factor grades, itemized deductions,
+    coverage, issue catalog, next actions and score history."""
     err = _read_auth(req, org)
     if err:
         return err
     return cc.scorecard(org)
+
+
+_ISSUE_TYPE_RE = re.compile(r"^[a-z0-9_-]{1,40}$")
+
+
+@app.get("/api/posture/plan")
+def api_scorecard_plan(org: str = _DEFAULT_ORG, fix: str = "", req: Request = None):
+    """Score planner: projected rating with the selected issue types fixed."""
+    err = _read_auth(req, org)
+    if err:
+        return err
+    import scorecard as sc
+    types = [t.strip() for t in str(fix or "").split(",") if t.strip()]
+    if len(types) > 50 or any(not _ISSUE_TYPE_RE.match(t) or t not in sc.ISSUE_TYPES
+                              for t in types):
+        return JSONResponse({"error": "unknown issue type"}, status_code=400)
+    return cc.scorecard_plan(org, types)
+
+
+@app.get("/api/hosts")
+def api_hosts(org: str = _DEFAULT_ORG, req: Request = None):
+    """Per-host (subdomain) ratings from the same model, weakest first."""
+    err = _read_auth(req, org)
+    if err:
+        return err
+    return cc.hosts(org)
+
+
+@app.get("/api/portfolio")
+def api_portfolio(req: Request = None):
+    """Every registered org's rating, factor grades and trend side by side."""
+    if not _auth_ok(req):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return cc.portfolio()
+
+
+@app.get("/api/dependencies")
+def api_dependencies(org: str = _DEFAULT_ORG, req: Request = None):
+    """Externally visible packages (with CVEs, fix versions, end-of-life),
+    third-party script origins and service providers."""
+    err = _read_auth(req, org)
+    if err:
+        return err
+    return cc.dependencies(org)
+
+
+@app.post("/api/orgs/{slug}/live-cves")
+def api_refresh_live_cves(slug: str, req: Request):
+    """Re-capture live advisories (cve.now) for the current snapshot.
+
+    Opt-in like scan-time capture (CTI_CVE_NOW=1); only package names,
+    versions and CVE ids are sent. Holds the org's job slot so it cannot
+    race a scan, and runs synchronously within bounded lookups.
+    """
+    err, _ = _require_org(slug, req)
+    if err:
+        return err
+    import live_cve
+    if not live_cve.enabled():
+        return JSONResponse({"error": "live CVE source disabled",
+                             "hint": "set CTI_CVE_NOW=1 to send package names and versions to cve.now"},
+                            status_code=403)
+    ok, jid = _try_acquire_job(slug, "live-cves")
+    if not ok:
+        return _job_busy_response(slug, "live-cves", jid)
+    try:
+        result = cc.refresh_live_cves(slug)
+    except Exception as e:
+        _release_job(slug, "live-cves", jid, error=e)
+        _log_event("warn", "live-cves", slug, f"refresh failed: {type(e).__name__}", job_id=jid)
+        return JSONResponse({"error": "refresh failed"}, status_code=502)
+    _release_job(slug, "live-cves", jid, result=result)
+    _log_event("info", "live-cves", slug,
+               f"live advisories refreshed: {result.get('advisories', 0)}", job_id=jid)
+    return result
+
+
+@app.get("/api/dependencies/cyclonedx")
+def api_dependencies_cyclonedx(org: str = _DEFAULT_ORG, req: Request = None):
+    """CycloneDX 1.5 BOM of the externally observed components (incomplete
+    by declaration: an outside-in view, not an application SBOM)."""
+    err = _read_auth(req, org)
+    if err:
+        return err
+    return Response(json.dumps(cc.dependencies_cyclonedx(org), indent=2),
+                    media_type="application/vnd.cyclonedx+json",
+                    headers={"Content-Disposition": f'attachment; filename="{org}-external.cdx.json"'})
 
 
 @app.get("/api/findings")
@@ -937,6 +1030,91 @@ def api_get_ai_profile(slug: str, req: Request = None):
             "capabilities": ai_providers.get_capabilities()}
 
 
+@app.get("/api/ai/providers")
+def api_ai_providers(req: Request = None):
+    """Supported AI providers with connection status (env names, never values)."""
+    if not _auth_ok(req):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return ai_providers.provider_catalog()
+
+
+# Model calls are slow and billed: a small cap keeps a stuck provider (or a
+# double-click) from piling up requests.
+_AI_SLOTS = threading.BoundedSemaphore(2)
+
+
+def _ai_busy():
+    return JSONResponse({"error": "the assistant is busy; try again shortly"}, status_code=429)
+
+
+@app.post("/api/ai/providers/{name}/test")
+def api_ai_provider_test(name: str, req: Request):
+    """One tiny call to confirm a provider answers."""
+    if not _auth_ok(req):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    profiles, _ = ai_providers.load_profiles()
+    if name not in profiles:
+        return JSONResponse({"error": "provider not connected"}, status_code=404)
+    if not _AI_SLOTS.acquire(blocking=False):
+        return _ai_busy()
+    try:
+        started = time.time()
+        content, prov = ai_providers.call_ai(
+            'Reply with exactly this JSON object and nothing else: {"ok": true}', profile_name=name)
+    finally:
+        _AI_SLOTS.release()
+    ok = bool(content) and '"ok"' in content.replace(" ", "")
+    _log_event("info" if ok else "warn", "ai-test", "", f"provider test {name}: {'ok' if ok else 'failed'}")
+    return {"ok": ok, "elapsed_ms": int((time.time() - started) * 1000),
+            "model": (prov or {}).get("model"),
+            "error": None if ok else ((prov or {}).get("error") or "unexpected reply")}
+
+
+class AssistantBody(BaseModel):
+    question: str
+    profile: Optional[str] = None
+    model: Optional[str] = None
+    history: Optional[list] = None
+
+
+@app.post("/api/orgs/{slug}/assistant")
+def api_assistant(slug: str, body: AssistantBody, req: Request):
+    """Ask the read-only analyst agent about one organization.
+
+    The selected provider receives the question and this org's posture data;
+    the agent's tools only read (rating, issues, planner, packages, findings).
+    """
+    err, _ = _require_org(slug, req)
+    if err:
+        return err
+    question = (body.question or "").strip()
+    if not 1 <= len(question) <= 1000:
+        return JSONResponse({"error": "question must be 1-1000 characters"}, status_code=400)
+    profiles, default = ai_providers.load_profiles()
+    profile = body.profile or default
+    if not profile or profile not in profiles:
+        return JSONResponse({"error": "no connected AI provider selected"}, status_code=400)
+    if body.model and body.model not in ai_providers.allowed_models(profile):
+        return JSONResponse({"error": "model not available for this provider"}, status_code=400)
+    if not _AI_SLOTS.acquire(blocking=False):
+        return _ai_busy()
+    try:
+        import assistant
+        result = assistant.ask(slug, question, profile, model=body.model or None,
+                               history=(body.history or [])[-assistant.HISTORY_TURNS:])
+    except Exception as e:
+        _log_event("error", "assistant", slug, f"assistant failed: {type(e).__name__}")
+        return JSONResponse({"error": "assistant failed"}, status_code=500)
+    finally:
+        _AI_SLOTS.release()
+    _log_event("info" if not result.get("error") else "warn", "assistant", slug,
+               f"assistant via {profile}: {len(result.get('steps') or [])} tool step(s), "
+               f"{result.get('elapsed_ms')} ms" + (f", error: {result['error']}" if result.get("error") else ""))
+    if result.get("error"):
+        return JSONResponse(result, status_code=502)
+    return result
+
+
 class AiProfileBody(BaseModel):
     ai_profile: str = ""
 
@@ -1044,6 +1222,43 @@ def api_org_register(body: RegisterOrg, req: Request):
 
     _log_event("info", "system", slug, f"workspace registered ({name}, {len(domains)} domain(s))")
     return {"slug": slug, "name": name, "domains": domains, "ai_profile": ai_profile or None}
+
+
+class RenameOrgBody(BaseModel):
+    name: str
+    model_config = {"extra": "forbid"}
+
+
+@app.patch("/api/orgs/{slug}")
+def api_org_rename(slug: str, body: RenameOrgBody, req: Request):
+    """Change only the display name; preserve scope, paths and organization id."""
+    err, _ = _require_org(slug, req)
+    if err is not None:
+        return err
+    name = body.name.strip()
+    if not name or len(name) > 200 or any(ord(c) < 32 or ord(c) == 127 for c in name):
+        return JSONResponse({"error": "name must contain 1–200 characters without control characters"},
+                            status_code=400)
+    with _registry_lock:
+        try:
+            with open(ORGS_JSON) as f:
+                registry = json.load(f)
+            if not isinstance(registry, dict):
+                raise ValueError("invalid registry")
+        except (OSError, ValueError):
+            return JSONResponse({"error": "registry unavailable or corrupted, aborting"}, status_code=500)
+        entry = registry.get(slug)
+        if not isinstance(entry, dict):
+            return _org_not_found(slug)
+        if entry.get("name") != name:
+            entry["name"] = name
+            try:
+                cc._atomic_write_json(ORGS_JSON, registry)
+            except OSError:
+                return JSONResponse({"error": "could not save organization name"}, status_code=500)
+        cc._reload_registry()
+    _log_event("info", "system", slug, "organization display name updated")
+    return {"slug": slug, "name": name}
 
 
 class DomainsBody(BaseModel):
@@ -1438,6 +1653,69 @@ def _render_value(v):
     return _esc(v)
 
 
+def _report_posture_html(data):
+    """Executive brief from the same assessment used by the dashboard."""
+    data = cc._mask_deep(data)
+    summary = data.get("summary") or {}
+    changes = {c["domain"]: c for c in (data.get("progress") or {}).get("changes", [])}
+    rows, details = [], []
+    for card in data.get("domains", []):
+        change = changes.get(card["domain"], {})
+        delta = change.get("delta")
+        movement = f"{delta:+d} points" if delta is not None else change.get("reason", "No previous scan")
+        score = "Not assessed" if card["unknown"] else f"{card['score']}/100 · {card['grade']}"
+        rows.append(f"<tr><td>{_esc(card['domain'])}</td><td>{_esc(score)}</td>"
+                    f"<td>{_esc(card['coverage'])}%</td><td>{_esc(movement)}</td></tr>")
+        pillars = "".join(f"<tr><td>{_esc(p['label'])} ({_esc(p['max'])}%)</td>"
+                          f"<td>{'Not assessed' if p['unknown'] else _esc(p.get('grade')) + ' · ' + _esc(p.get('score')) + '/100'}</td>"
+                          f"<td>{_esc(p['note'])}</td></tr>" for p in card["pillars"])
+        caps = []
+        if card.get("critical_cap"):
+            caps.append("Score capped by a critical CVE match; applicability requires verification.")
+        if card.get("coverage_cap"):
+            caps.append("Grade limited by incomplete assessment coverage.")
+        details.append(f"<h3>{_esc(card['domain'])}</h3><p>{_esc(' '.join(caps))}</p>"
+                       f"<table><tr><th>Risk factor (weight)</th><th>Grade</th><th>Evidence</th></tr>{pillars}</table>")
+    actions = data.get("actions") or []
+    action_rows = "".join(
+        f"<tr><td>{_esc(a['priority'])}</td><td>{_esc(a['domain'])}<br>{_esc(a['title'])}"
+        f"<br>{_esc(a.get('evidence', ''))}</td>"
+        f"<td>{'+' + _esc(a['gain']) if a.get('gain') else '—'}</td>"
+        f"<td>{_esc(a['next_step'])}</td></tr>" for a in actions[:10])
+    score = (f"{summary.get('average_score', 0)}/100 · {summary.get('average_grade', '?')}"
+             if summary.get("assessed") else "Not assessed")
+    factor_rows = "".join(
+        f"<tr><td>{_esc(f['label'])}</td><td>{_esc(f['weight'])}%</td>"
+        f"<td>{'Not assessed' if f['score'] is None else _esc(f['grade']) + ' · ' + _esc(f['score']) + '/100'}</td></tr>"
+        for f in summary.get("factors") or [])
+    issue_rows = "".join(
+        f"<tr><td>{_esc(i['severity'])}</td><td>{_esc(i['title'])}</td><td>{_esc(i['count'])}</td>"
+        f"<td>{'+' + _esc(i['gain']) if i.get('gain') else '—'}</td><td>{_esc(i['fix'])}</td></tr>"
+        for i in (data.get("issues") or [])[:12])
+    return ("<section class='executive'><h2>Executive security brief</h2>"
+            f"<p class='rating'>{_esc(score)}</p>"
+            f"<p>Evidence collected: {_esc(data.get('scanned') or 'No scan recorded')} · "
+            f"{_esc(summary.get('assessed', 0))} of {_esc(summary.get('domains', 0))} domains assessed</p>"
+            "<p>This rating reflects observable external evidence under a fixed rubric. "
+            "It does not measure internal controls, compliance, or peer performance. "
+            "CVE matches require verification; missing evidence is not a clean result.</p>"
+            "<table><tr><th>Domain</th><th>Rating</th><th>Coverage</th><th>Since previous scan</th></tr>"
+            + ("".join(rows) or "<tr><td colspan='4'>Register a domain and run a scan.</td></tr>")
+            + "</table>"
+            + ("<h2>Risk factors</h2><table><tr><th>Factor</th><th>Weight</th><th>Grade</th></tr>"
+               + factor_rows + "</table>" if factor_rows else "")
+            + ("<h2>Top issues</h2><p>Rating gain is the projected change in the average "
+               "if the issue were fixed on every domain, under the current model.</p>"
+               "<table><tr><th>Severity</th><th>Issue</th><th>Findings</th><th>Rating gain</th>"
+               "<th>Fix</th></tr>" + issue_rows + "</table>" if issue_rows else "")
+            + "<h2>Next actions</h2><p>Priorities from observed deductions and assessment gaps. "
+            "Rescan after remediation to verify the result; score gains are not guaranteed.</p>"
+            + (f"<p>Showing {min(10, len(actions))} of {len(actions)} scored actions.</p>"
+               "<table><tr><th>Priority</th><th>Scope and evidence</th><th>Gain</th><th>Next step</th></tr>"
+               + action_rows + "</table>" if actions else "<p>No scored actions in the available evidence.</p>")
+            + "<h2>Assessment detail</h2>" + "".join(details) + "</section>")
+
+
 def _build_report_html(slug, org, fs, domains):
     name = _esc(org.get("name") or slug)
     domains_s = ", ".join(_esc(d) for d in domains) or "&mdash;"
@@ -1461,6 +1739,7 @@ def _build_report_html(slug, org, fs, domains):
         sev_rows += (f"<tr><td>RESOLVED (excluded from sections)</td>"
                      f"<td>{resolved_n}</td></tr>")
 
+    posture_html = _report_posture_html(cc.scorecard(slug))
     sections = []
     for i, f in enumerate(fs, 1):
         fields = []
@@ -1480,7 +1759,7 @@ def _build_report_html(slug, org, fs, domains):
 <style>
  body {{ font-family: -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
          color: #1a1a2e; margin: 0; }}
- .cover {{ padding: 80px 60px; page-break-after: always; }}
+ .cover {{ padding: 32px 24px 8px; }}
  .cover h1 {{ font-size: 34px; margin-bottom: 8px; }}
  .cover .sub {{ color: #555; font-size: 16px; margin-bottom: 40px; }}
  table {{ width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 13px; }}
@@ -1490,20 +1769,28 @@ def _build_report_html(slug, org, fs, domains):
  h2 {{ font-size: 16px; margin: 26px 0 4px; border-bottom: 2px solid #eee;
        padding-bottom: 4px; }}
  .finding {{ padding: 0 24px; page-break-inside: avoid; }}
+ .executive {{ padding: 0 24px; page-break-after: always; }}
+ .rating {{ font-size: 30px; font-weight: bold; margin: 12px 0; }}
+ tr {{ break-inside: avoid; }}
+ h2, h3 {{ break-after: avoid; }}
+ @media print {{ body {{ -webkit-print-color-adjust: exact; }} }}
  pre {{ white-space: pre-wrap; font-size: 12px; margin: 0; }}
  .na {{ color: #999; }}
 </style></head>
 <body>
 <div class='cover'>
-  <h1>CTI Radar — Correlation Report</h1>
+  <h1>Parallax — External Security Posture</h1>
   <div class='sub'>{name} &middot; {date_s}</div>
   <p><strong>Domains:</strong> {domains_s}</p>
+</div>
+{posture_html}
+<section class='finding'><h2>Finding summary</h2>
   <table>
     <tr><th>Severity</th><th>Count</th></tr>
     {sev_rows}
     <tr><th>Total findings</th><th>{_esc(len(fs))}</th></tr>
   </table>
-</div>
+</section>
 {''.join(sections)}
 </body></html>"""
 
@@ -1514,22 +1801,39 @@ _MAX_PDF_HTML_SIZE = 5 * 1024 * 1024  # 5 MiB
 _PDF_TIMEOUT = 45  # seconds
 
 
-@app.get("/api/orgs/{slug}/report.pdf")
-def api_org_report_pdf(slug: str, req: Request = None):
+def _prepare_report(slug, req):
     err, org = _require_org(slug, req)
     if err:
-        return err
+        return None, err
     fs, _ = cc.load_data(slug)
     if len(fs) > _MAX_PDF_FINDINGS:
-        return JSONResponse({"error": "too many findings for PDF", "max": _MAX_PDF_FINDINGS,
+        return None, JSONResponse({"error": "too many findings for report", "max": _MAX_PDF_FINDINGS,
                              "count": len(fs)}, status_code=413)
     domains = org.get("domains") or []
     report_html = _build_report_html(slug, org, fs, domains)
     if len(report_html) > _MAX_PDF_HTML_SIZE:
-        return JSONResponse({"error": "report too large", "max": _MAX_PDF_HTML_SIZE}, status_code=413)
+        return None, JSONResponse({"error": "report too large", "max": _MAX_PDF_HTML_SIZE}, status_code=413)
+    return report_html, None
+
+
+def _html_report_response(slug, content):
+    return Response(content=content, media_type="text/html",
+                    headers={"Content-Disposition": f'attachment; filename="{slug}-report.html"'})
+
+
+@app.get("/api/orgs/{slug}/report.html")
+def api_org_report_html(slug: str, req: Request = None):
+    report_html, err = _prepare_report(slug, req)
+    return err if err is not None else _html_report_response(slug, report_html)
+
+
+@app.get("/api/orgs/{slug}/report.pdf")
+def api_org_report_pdf(slug: str, req: Request = None):
+    report_html, err = _prepare_report(slug, req)
+    if err is not None:
+        return err
     if not _CHROMIUM:
-        return JSONResponse(
-            {"error": "Chromium not found; set CTI_CHROMIUM_PATH"}, status_code=503)
+        return _html_report_response(slug, report_html)
     if not _PDF_SEMAPHORE.acquire(blocking=False):
         return JSONResponse({"error": "PDF generation busy, try again"}, status_code=503)
 

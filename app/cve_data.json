@@ -1,7 +1,7 @@
 {
   "_meta": {
-    "updated": "2026-08-22",
-    "policy": "High-impact (CVSS >= 7.0), well-known CVEs only. Matches are advisory: findings are tiered CORRELATED and must be verified against the affected range before action. Ranges are OR-combined; operators within a range are AND-combined. Versions are compared by leading numeric components (7.1p2 -> 7.1).",
+    "updated": "2026-10-23",
+    "policy": "Selected, well-known CVEs, primarily high-impact. Severity follows the cited advisory; moderate advisories are not promoted to high. Matches are advisory: findings are tiered CORRELATED and must be verified against the affected range before action. Ranges are OR-combined; operators within a range are AND-combined. Versions are compared by leading numeric components (7.1p2 -> 7.1).",
     "confidence": "single numeric component (e.g. 'Apache/2') -> low; two or more components -> medium"
   },
   "products": {
@@ -35,10 +35,7 @@
       "cves": [
         {"cve": "CVE-2024-6387", "severity": "HIGH", "cvss": 8.1, "fix_version": "9.8p1",
          "ranges": [">=8.5,<=9.7"],
-         "summary": "regreSSHion: signal-handler race enables unauthenticated RCE as root (glibc)"},
-        {"cve": "CVE-2023-38408", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "9.3p2",
-         "ranges": [">=5.5,<=9.3"],
-         "summary": "ssh-agent forwarding PKCS#11 command injection enables RCE on the agent host"}
+         "summary": "regreSSHion: signal-handler race enables unauthenticated RCE as root (glibc)"}
       ]
     },
     "php": {
@@ -203,12 +200,13 @@
          "summary": "XSS via the collapse plugin's data-parent selector"}
       ]
     },
-    "angular": {
-      "aliases": ["angular", "angularjs"],
+    "angularjs": {
+      "aliases": ["angularjs", "angular.js"],
       "cves": [
-        {"cve": "CVE-2023-26116", "severity": "HIGH", "cvss": 7.5, "fix_version": "16.2.0",
-         "ranges": [">=0.0.0,<16.2.0"],
-         "summary": "AngularJS/Angular prototype pollution via angular.merge on untrusted input"}
+        {"cve": "CVE-2023-26116", "severity": "MEDIUM", "cvss": 5.3, "fix_version": null,
+         "ranges": [">=0.0.0,<=1.8.3"],
+         "source": "https://github.com/advisories/GHSA-2vrf-hf26-jrp5",
+         "summary": "AngularJS angular.copy() regular-expression denial of service; no patched version listed"}
       ]
     },
     "drupal": {
@@ -348,5 +346,12 @@
          "summary": "ProxyLogon: SSRF in the Exchange HTTP protocol enables authentication bypass and RCE"}
       ]
     }
-  }
+  },
+  "withdrawn": [
+    {"cve": "CVE-2023-38408",
+     "product": "openssh",
+     "withdrawn": "2026-10-23",
+     "reason": "ssh-agent PKCS#11 flaw: exploited when a client forwards its agent to a malicious server. An sshd banner says nothing about client agent use, so matching it against server versions produced false critical exposure.",
+     "source": "https://nvd.nist.gov/vuln/detail/CVE-2023-38408"}
+  ]
 }

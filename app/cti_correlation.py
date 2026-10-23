@@ -1299,6 +1299,11 @@ def software_from_meta(meta, findings=None):
         import cve_match
     except Exception:          # pragma: no cover - import guard for app paths
         cve_match = None
+    # ids the current map rules on: matched ones it rejects for a version, and
+    # ones withdrawn outright (e.g. client-side flaws a server banner cannot show)
+    mapped_ids = ({c["cve"] for entry in cve_match.load_map().values() for c in entry["cves"]}
+                  | cve_match.withdrawn_ids()) if cve_match else set()
+    live_pkgs, _ = _live_intel(meta)
 
     rows = []
     for host, s in (fps.items() if isinstance(fps, dict) else []):
@@ -1336,6 +1341,7 @@ def software_from_meta(meta, findings=None):
                 except Exception:
                     hits = []
                 ids = {str(m["cve"]) for m in hits if m.get("cve")}
+                ids.update(_live_package_ids(live_pkgs, prod, v.get("version")))
                 cves_by_product.setdefault(prod, set()).update(ids)
         # findings-declared CVEs remain a host-level fallback for products the
         # live map does not cover (e.g. an AI- or NVD-derived match)
@@ -1356,7 +1362,9 @@ def software_from_meta(meta, findings=None):
                 versioned_products = [x for x in (versions if isinstance(versions, list) else [])
                                       if isinstance(x, dict) and x.get("version")]
                 if len(versioned_products) == 1:
-                    prod_cves = set(host_cves)
+                    # A historical finding must not resurrect a match that
+                    # the current advisory map rejects for this version.
+                    prod_cves = host_cves - mapped_ids
             rows.append({
                 "host": h,
                 "product": product,
@@ -1575,8 +1583,421 @@ def dns_posture(org=DEFAULT_ORG):
             "scanned": meta.get("date") or ""}
 
 
-def _cve_severity_map():
-    """{CVE id -> CRITICAL|HIGH} from the vendored map (scorecard input)."""
+def dependencies_from_meta(meta, domains=()):
+    """Outside-in package and dependency inventory from one scan snapshot.
+
+    packages   one row per (package, version) across hosts: server software
+               and frameworks from banners/markup, front-end libraries and
+               WordPress plugins/themes from the scripts each page loads —
+               with every matched CVE, its fix version, and lifecycle status
+    origins    third-party hosts that pages load scripts/styles from
+    providers  service providers implied by DNS records and script origins
+
+    Read-only and offline: CVEs come from the vendored map, lifecycle and
+    provider rules from dependencies.py. Evidence strings are PII-masked;
+    product and version fields are not (a 4-part version looks like an IP).
+    """
+    import cve_match
+    import dependencies as deps
+    import tech_detect
+    meta = meta or {}
+    fps = meta.get("fingerprints") or {}
+    if not isinstance(fps, dict):
+        fps = {}
+    owned = [str(d).strip().lower().rstrip(".") for d in domains or () if str(d).strip()]
+
+    def first_party(host):
+        return any(host == d or host.endswith("." + d) for d in owned)
+
+    def where(text):
+        return _mask_value("evidence", str(text or ""))[:200]
+
+    packages, origins = {}, {}
+    pages = 0
+
+    def add(name, version, kind, host, evidence, source):
+        key = (str(name).lower(), str(version or ""))
+        row = packages.setdefault(key, {
+            "package": str(name), "version": str(version or ""), "kind": kind,
+            "hosts": [], "evidence": []})
+        if host not in row["hosts"]:
+            row["hosts"].append(host)
+        if len(row["evidence"]) < 12 and not any(
+                e["host"] == host and e["where"] == evidence for e in row["evidence"]):
+            row["evidence"].append({"host": host, "where": evidence, "source": source})
+
+    for host, s in sorted(fps.items()):
+        if not isinstance(s, dict):
+            continue
+        details = {str(d.get("product", "")).lower(): d for d in (s.get("tech_detail") or [])
+                   if isinstance(d, dict)}
+        assets = s.get("assets") if isinstance(s.get("assets"), list) else None
+        asset_libs = {(str(a.get("library") or "").lower(), str(a.get("version") or ""))
+                      for a in assets or () if isinstance(a, dict)}
+        for v in s.get("versions") or ():
+            if not isinstance(v, dict) or not v.get("product"):
+                continue
+            product, version = str(v["product"]), str(v.get("version") or "")
+            if (product.lower(), version) in asset_libs:
+                continue           # reported below with the asset URL as evidence
+            det = details.get(product.lower()) or {}
+            evidence = det.get("evidence") or next(
+                (("%s: %s" % (h, s[h])) for h in ("server", "x-powered-by", "x-generator", "generator")
+                 if product.lower() in str(s.get(h) or "").lower()), "response headers / markup")
+            add(product, version, tech_detect.kind_of(product), host, where(evidence),
+                det.get("source") or "banner")
+        for product, det in details.items():
+            if not det.get("version") and product:
+                add(det.get("product") or product, "", tech_detect.kind_of(product), host,
+                    where(det.get("evidence") or ""), det.get("source") or "markup")
+        if assets is None:
+            continue
+        pages += 1
+        for a in assets:
+            if not isinstance(a, dict):
+                continue
+            lib = a.get("library")
+            if lib:
+                kind = ("wordpress-plugin" if lib.startswith("wp-plugin/") else
+                        "wordpress-theme" if lib.startswith("wp-theme/") else
+                        tech_detect.kind_of(lib) if tech_detect.kind_of(lib) != "other" else
+                        "js-library" if a.get("kind") == "script" else "css-framework")
+                add(lib, a.get("version"), kind, host, where(a.get("url")), a.get("source") or "asset")
+            ahost = str(a.get("host") or "")
+            if a.get("third_party") and not first_party(ahost):
+                o = origins.setdefault(ahost, {
+                    "host": ahost, "provider": None, "category": None,
+                    "pages": [], "assets": 0, "scripts": 0, "with_sri": 0,
+                    "compromised": deps.compromised(ahost), "insecure": 0})
+                known = deps.script_provider(ahost)
+                if known:
+                    o["provider"], o["category"] = known
+                if host not in o["pages"]:
+                    o["pages"].append(host)
+                o["assets"] += 1
+                o["scripts"] += a.get("kind") == "script"
+                o["with_sri"] += bool(a.get("sri"))
+                o["insecure"] += bool(a.get("insecure"))
+
+    import live_cve
+    live_pkgs, live_cves = _live_intel(meta)
+    sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+    rows = []
+    for row in packages.values():
+        cves = {}
+        if row["version"]:
+            try:
+                for c in cve_match.match_cves([{"product": row["package"], "version": row["version"]}]):
+                    cves[c["cve"]] = {k: c.get(k) for k in ("cve", "severity", "cvss", "summary",
+                                                             "fix_version", "confidence")}
+                    cves[c["cve"]]["source"] = "offline map"
+            except Exception:
+                pass
+        for cid in _live_package_ids(live_pkgs, row["package"], row["version"]):
+            cves.setdefault(cid, {"cve": cid, "source": "cve.now", "confidence": "medium"})
+        for cid, c in cves.items():
+            rec = live_cves.get(cid)
+            if not rec:
+                continue
+            c.update(
+                severity=live_cve.severity_of(rec) or c.get("severity") or "MEDIUM",
+                cvss=rec.get("cvss") if rec.get("cvss") is not None else c.get("cvss"),
+                vector=rec.get("vector") or None,
+                summary=rec.get("title") or rec.get("summary") or c.get("summary") or "",
+                fix_version=rec.get("fixed") or c.get("fix_version"),
+                kev=rec.get("kev"), exploit_db=bool(rec.get("exploit_db")),
+                published=rec.get("published"),
+                source="cve.now" if c.get("source") == "cve.now" else "offline map + cve.now")
+        cves = sorted(cves.values(), key=lambda c: (
+            not c.get("kev"), sev_rank.get(str(c.get("severity") or "").upper(), 9), c["cve"]))
+        fixes = [c["fix_version"] for c in cves if c.get("fix_version")]
+        eol = deps.end_of_life(row["package"], row["version"])
+        worst = min((str(c.get("severity") or "MEDIUM").upper() for c in cves),
+                    key=lambda s: sev_rank.get(s, 9), default=None)
+        row.update(
+            cves=cves, cve_count=len(cves), worst=worst,
+            known_exploited=sum(1 for c in cves if c.get("kev")),
+            upgrade_to=max(fixes, key=cve_match._vkey) if fixes else None,
+            end_of_life=eol,
+            status=("vulnerable" if cves else "end-of-life" if eol else
+                    "unversioned" if not row["version"] else "no known CVE"))
+        rows.append(row)
+    status_rank = {"vulnerable": 0, "end-of-life": 1, "no known CVE": 2, "unversioned": 3}
+    rows.sort(key=lambda r: (status_rank[r["status"]], not r["known_exploited"],
+                             sev_rank.get(r["worst"], 9), -len(r["hosts"]),
+                             r["package"], r["version"]))
+
+    providers = {}
+    dns = meta.get("dns_posture") if isinstance(meta.get("dns_posture"), list) else []
+    found = [p for v in dns if isinstance(v, dict) and isinstance(v.get("records"), dict)
+             for p in deps.providers_from_records(v.get("domain"), v["records"])]
+    found += [{"provider": o["provider"], "category": o["category"], "source": "script",
+               "domain": ", ".join(o["pages"][:3]), "evidence": o["host"]}
+              for o in origins.values() if o["provider"]]
+    for p in found:
+        row = providers.setdefault(p["provider"], {
+            "provider": p["provider"], "category": p["category"],
+            "sources": [], "domains": [], "evidence": []})
+        if p["source"] not in row["sources"]:
+            row["sources"].append(p["source"])
+        if p["domain"] and p["domain"] not in row["domains"]:
+            row["domains"].append(p["domain"])
+        if len(row["evidence"]) < 6:
+            row["evidence"].append(where("%s: %s" % (p["source"], p["evidence"])))
+    origin_rows = sorted(origins.values(), key=lambda o: (
+        not o["compromised"], -len(o["pages"]), o["host"]))
+    return {
+        "summary": {
+            "pages": pages,
+            "packages": len(rows),
+            "vulnerable": sum(1 for r in rows if r["status"] == "vulnerable"),
+            "critical": sum(1 for r in rows if r["worst"] == "CRITICAL"),
+            "known_exploited": sum(1 for r in rows if r["known_exploited"]),
+            "end_of_life": sum(1 for r in rows if r["end_of_life"]),
+            "cves": sum(r["cve_count"] for r in rows),
+            "third_party_origins": len(origin_rows),
+            "compromised": sum(1 for o in origin_rows if o["compromised"]),
+            "providers": len(providers),
+        },
+        "packages": rows,
+        "intel": _intel_status(meta),
+        "origins": origin_rows,
+        "providers": sorted(providers.values(), key=lambda p: (p["category"] or "", p["provider"])),
+    }
+
+
+def dependency_snapshot(meta, domains=()):
+    """Compact per-scan record of what each page loads, for drift detection.
+
+    `pages` lists the hosts whose markup was examined, so a page that simply
+    failed to load next time is never mistaken for scripts being removed.
+    """
+    inv = dependencies_from_meta(meta, domains)
+    fps = (meta or {}).get("fingerprints") or {}
+    pages = sorted(h for h, s in (fps.items() if isinstance(fps, dict) else [])
+                   if isinstance(s, dict) and isinstance(s.get("assets"), list))
+    return {
+        "pages": pages[:500],
+        "origins": sorted({"%s>%s" % (page, o["host"])
+                           for o in inv["origins"] for page in o["pages"]})[:1000],
+        "packages": sorted({"%s>%s@%s" % (host, p["package"], p["version"])
+                            for p in inv["packages"] if p["version"]
+                            for host in p["hosts"]})[:1000],
+    }
+
+
+def dependency_changes(current, events):
+    """What pages load now that they did not at the preceding scan.
+
+    Only pages examined in BOTH scans are compared: a first look at a page
+    is a baseline, not drift, and a page that failed to load is not a
+    removal. A new third-party origin on a known page is the externally
+    visible signature of script injection (Magecart-style skimmers), so it
+    is reported even when nothing else changed.
+    """
+    scans = [e for e in events or () if isinstance(e, dict) and e.get("kind") == "scan"
+             and isinstance(e.get("dependencies"), dict)]
+    previous = scans[-1] if scans else None
+    if previous and previous["dependencies"] == current:
+        previous = scans[-2] if len(scans) > 1 else None
+    if not previous:
+        return {"baseline_at": None, "new_origins": [], "removed_origins": [],
+                "new_packages": [], "removed_packages": [], "version_changes": []}
+    old = previous["dependencies"]
+    both = set(current.get("pages") or ()) & set(old.get("pages") or ())
+
+    def on_known_pages(items):
+        return {i for i in items if i.split(">", 1)[0] in both}
+
+    def split(item):
+        page, rest = item.split(">", 1)
+        return page, rest
+
+    now_o, old_o = on_known_pages(current.get("origins") or ()), on_known_pages(old.get("origins") or ())
+    now_p, old_p = on_known_pages(current.get("packages") or ()), on_known_pages(old.get("packages") or ())
+    old_names = {}
+    for item in old_p:
+        page, pkg = split(item)
+        old_names.setdefault((page, pkg.rsplit("@", 1)[0]), set()).add(pkg.rsplit("@", 1)[1])
+    changes, added = [], []
+    for item in sorted(now_p - old_p):
+        page, pkg = split(item)
+        name, version = pkg.rsplit("@", 1)
+        before = old_names.get((page, name))
+        if before:
+            changes.append({"page": page, "package": name, "from": sorted(before), "to": version})
+        else:
+            added.append({"page": page, "package": name, "version": version})
+    changed = {(c["page"], c["package"]) for c in changes}
+    removed = []
+    for item in sorted(old_p - now_p):
+        page, pkg = split(item)
+        name, version = pkg.rsplit("@", 1)
+        if (page, name) not in changed:
+            removed.append({"page": page, "package": name, "version": version})
+    import dependencies as deps
+    return {
+        "baseline_at": previous.get("ts"),
+        "new_origins": [{"page": p, "origin": o, "compromised": deps.compromised(o),
+                         "provider": (deps.script_provider(o) or (None,))[0]}
+                        for p, o in (split(i) for i in sorted(now_o - old_o))],
+        "removed_origins": [{"page": p, "origin": o} for p, o in (split(i) for i in sorted(old_o - now_o))],
+        "new_packages": added, "removed_packages": removed, "version_changes": changes,
+    }
+
+
+def _intel_status(meta):
+    """Where the CVE data on this page came from, for the freshness note."""
+    import live_cve
+    live = (meta or {}).get("live_cves")
+    status = {"offline_map": True, "live_enabled": live_cve.enabled(), "live": None}
+    if isinstance(live, dict):
+        status["live"] = {k: live.get(k) for k in ("source", "fetched_at", "complete", "errors")}
+        status["live"]["packages"] = len(live.get("packages") or {})
+        status["live"]["advisories"] = len(live.get("cves") or {})
+    return status
+
+
+def refresh_live_cves(org=DEFAULT_ORG):
+    """Re-capture live advisories for the current snapshot (explicit action).
+
+    Network I/O happens before the org lock; the write is a single locked
+    read-modify-write of meta.live_cves, so a concurrent scan's evidence is
+    never overwritten with intel fetched for an older snapshot.
+    """
+    import live_cve
+    fs, _, _, meta = copy.deepcopy(_cached_org_data(org))
+    date = (meta or {}).get("date")
+    live = live_cve.collect((meta or {}).get("fingerprints") or {})
+    path = org_findings_path(org)
+    with _org_lock(org):
+        with open(path) as f:
+            d = json.load(f)
+        current = d.setdefault("meta", {})
+        if current.get("date") != date:
+            return {"updated": False, "reason": "a newer scan replaced the snapshot; rescan or retry"}
+        current["live_cves"] = live
+        _atomic_write_json(path, d)
+    invalidate_org_cache(org)
+    return {"updated": True, "live": {k: live[k] for k in ("fetched_at", "complete", "errors")},
+            "packages": len(live["packages"]), "advisories": len(live["cves"])}
+
+
+def dependencies(org=DEFAULT_ORG):
+    fs, _, _, meta = copy.deepcopy(_cached_org_data(org))
+    domains = (REGISTRY.get(org) or {}).get("domains") or []
+    result = dependencies_from_meta(meta, domains)
+    result["scanned"] = meta.get("date") or ""
+    result["changes"] = dependency_changes(dependency_snapshot(meta, domains), load_history(org))
+    return result
+
+
+def _cvss_method(vector):
+    v = str(vector or "")
+    if v.startswith("CVSS:4.0"):
+        return "CVSSv4"
+    if v.startswith("CVSS:3.1"):
+        return "CVSSv31"
+    return "CVSSv3"
+
+
+def _purl(package, version):
+    from urllib.parse import quote
+    import dependencies as deps
+    name = deps.NPM_NAMES.get(package)
+    if name:
+        return "pkg:npm/%s@%s" % (quote(name, safe="/"), quote(version))
+    if package.startswith(("wp-plugin/", "wp-theme/")):
+        return None
+    return "pkg:generic/%s@%s" % (quote(package, safe=""), quote(version))
+
+
+def dependencies_cyclonedx(org=DEFAULT_ORG):
+    """CycloneDX 1.5 BOM of the externally observed components and their CVEs.
+
+    Declared `incomplete`: an outside-in view sees only what pages and
+    banners disclose, never the full dependency tree of an application.
+    """
+    import uuid
+    inv = dependencies(org)
+    org_meta = REGISTRY.get(org) or {}
+    components, vulns = [], {}
+    for i, p in enumerate(p for p in inv["packages"] if p["version"]):
+        ref = "component-%d" % (i + 1)
+        comp = {"type": "framework" if p["kind"] in ("js-framework", "server-framework", "cms")
+                else "library", "bom-ref": ref, "name": p["package"], "version": p["version"],
+                "properties": [{"name": "parallax:observed-on", "value": h} for h in p["hosts"][:20]]
+                + [{"name": "parallax:evidence", "value": e["where"]} for e in p["evidence"][:5]]}
+        purl = _purl(p["package"], p["version"])
+        if purl:
+            comp["purl"] = purl
+        if p.get("end_of_life"):
+            comp["properties"].append({"name": "parallax:end-of-life", "value": p["end_of_life"]})
+        components.append(comp)
+        for c in p["cves"]:
+            v = vulns.setdefault(c["cve"], {
+                "bom-ref": "vuln-" + c["cve"], "id": c["cve"],
+                "source": {"name": "NVD", "url": "https://nvd.nist.gov/vuln/detail/" + c["cve"]},
+                "ratings": [{"severity": str(c.get("severity") or "unknown").lower(),
+                             **({"score": c["cvss"], "method": _cvss_method(c.get("vector"))}
+                                if c.get("cvss") is not None else {})}],
+                **({"properties": [{"name": "parallax:cisa-kev-added",
+                                    "value": str((c.get("kev") or {}).get("added") or "")}]}
+                   if c.get("kev") else {}),
+                "description": c.get("summary") or "",
+                "affects": []})
+            v["affects"].append({"ref": ref})
+            if c.get("fix_version"):
+                v["recommendation"] = "Upgrade to %s or later." % c["fix_version"]
+    return {
+        "bomFormat": "CycloneDX", "specVersion": "1.5",
+        "serialNumber": "urn:uuid:%s" % uuid.uuid4(), "version": 1,
+        "metadata": {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "tools": {"components": [{"type": "application", "name": "Parallax"}]},
+            "component": {"type": "application", "bom-ref": "org", "name": org_meta.get("name") or org},
+            "properties": [{"name": "parallax:collection",
+                            "value": "external passive observation, scan of %s" % (inv.get("scanned") or "unknown date")}],
+        },
+        "components": components,
+        "compositions": [{"aggregate": "incomplete", "assemblies": ["org"]}],
+        "vulnerabilities": list(vulns.values()),
+    }
+
+
+def _live_intel(meta):
+    """(packages {key: [ids]}, cves {id: record}) captured from cve.now, or empties."""
+    live = (meta or {}).get("live_cves")
+    if not isinstance(live, dict):
+        return {}, {}
+    pkgs = live.get("packages") if isinstance(live.get("packages"), dict) else {}
+    cves = live.get("cves") if isinstance(live.get("cves"), dict) else {}
+    return pkgs, {k: v for k, v in cves.items() if isinstance(v, dict)}
+
+
+def _live_package_ids(live_pkgs, product, version):
+    """Live advisory ids for one observed (product, version), via its npm name."""
+    import dependencies as deps
+    import live_cve
+    name = deps.NPM_NAMES.get(str(product or "").lower())
+    if not name or not version:
+        return []
+    ids = live_pkgs.get(live_cve.package_key("npm", name, version))
+    return [str(i) for i in ids] if isinstance(ids, list) else []
+
+
+def _known_exploited(meta):
+    """CVE ids the captured live intel lists in CISA KEV."""
+    _, cves = _live_intel(meta)
+    return {cid for cid, rec in cves.items() if rec.get("kev")}
+
+
+def _cve_severity_map(meta=None):
+    """{CVE id -> severity}: the vendored map, overridden by live intel.
+
+    Live CVSS (from the CNA or NVD via cve.now) is the fresher, cited source,
+    so it wins where present; the curated map fills the gaps.
+    """
     out = {}
     try:
         import cve_match
@@ -1584,39 +2005,190 @@ def _cve_severity_map():
             for cve in entry.get("cves", []):
                 cid = str(cve.get("cve") or "").upper()
                 sev = str(cve.get("severity") or "").upper()
-                if cid and sev in ("CRITICAL", "HIGH"):
+                ranks = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+                if cid and sev in ranks:
                     # keep the worst severity if an id appears under two products
-                    if out.get(cid) != "CRITICAL":
+                    if ranks[sev] < ranks.get(out.get(cid), 9):
                         out[cid] = sev
     except Exception:
         pass
+    import live_cve
+    for cid, rec in _live_intel(meta)[1].items():
+        sev = live_cve.severity_of(rec)
+        if sev:
+            out[cid] = sev
     return out
 
 
-def scorecard(org=DEFAULT_ORG):
-    """Composite per-domain scorecard over the three inventories.
+def scorecard_from_snapshot(domains, meta, fs, exclude=(), explain=True):
+    """Composite per-domain scorecard over the asset inventories.
 
     Deterministic and fully itemized: the response carries every deduction,
     the coverage actually examined, and any cap that was applied, so a reader
-    can reproduce the number instead of trusting it.
+    can reproduce the number instead of trusting it. `exclude` treats issue
+    types as fixed (the score planner); `explain` adds exact per-item gains
+    and the org-wide issue list.
     """
-    fs, _ = load_data(org)
-    meta = load_meta(org)
-    domains = (REGISTRY.get(org) or {}).get("domains") or []
-    try:
-        import scorecard as sc
-    except Exception:                      # pragma: no cover - import guard
-        return {"summary": {"domains": 0}, "domains": [], "scanned": ""}
+    import scorecard as sc
     software_rows = software_from_meta(meta, fs)
     cert_rows = certificates_from_meta(meta)
     dns_results = meta.get("dns_posture") or []
     if not isinstance(dns_results, list):
         dns_results = []
-    cards = sc.build(domains, meta, software_rows=software_rows,
-                     cert_rows=cert_rows, dns_results=dns_results,
-                     severity_map=_cve_severity_map())
-    return {"summary": sc.summarize(cards), "domains": cards,
-            "scanned": meta.get("date") or ""}
+    severity_map = _cve_severity_map(meta)
+    exploited = _known_exploited(meta)
+
+    def rebuild(more=(), explain=False):
+        return sc.build(domains, meta, software_rows=software_rows,
+                        cert_rows=cert_rows, dns_results=dns_results,
+                        severity_map=severity_map,
+                        exclude=set(exclude) | set(more), explain=explain,
+                        exploited=exploited)
+
+    cards = rebuild(explain=explain)
+    import posture
+    result = {"summary": sc.summarize(cards), "domains": cards,
+              "scanned": meta.get("date") or "",
+              "actions": posture.action_plan(cards),
+              "snapshot": posture.snapshot(cards, meta)}
+    result["issues"] = sc.org_issues(cards, rebuild if explain else None)
+    return result
+
+
+_SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+def hosts_from_snapshot(domains, meta, fs, only=None):
+    """Per-host (subdomain) ratings, weakest first, from one scan snapshot.
+
+    Each host is scored by the same model as its domain, from its own
+    evidence plus its domain's email & DNS verdict. Issue lists leave out the
+    inherited DNS deductions so they show what is specific to the host; a
+    takeover is kept, because it belongs to the host it was found on. An
+    unrated host has score None, never a 0 that reads like a result.
+    `only` returns just that host, with exact host-score gains per issue.
+    """
+    import scorecard as sc
+    meta = meta or {}
+    software_rows = software_from_meta(meta, fs)
+    cert_rows = certificates_from_meta(meta)
+    dns_results = meta.get("dns_posture") if isinstance(meta.get("dns_posture"), list) else []
+    cards = sc.build_hosts(domains, meta, software_rows=software_rows, cert_rows=cert_rows,
+                           dns_results=dns_results, severity_map=_cve_severity_map(meta),
+                           exploited=_known_exploited(meta), only=only, explain=bool(only))
+    open_by_host = defaultdict(int)
+    for f in fs or []:
+        if str(f.get("status") or "OPEN").upper() in ("OPEN", "IN_PROGRESS"):
+            open_by_host[str(f.get("target") or "").strip().lower()] += 1
+    services = meta.get("services") if isinstance(meta.get("services"), dict) else {}
+    rows = []
+    for c in cards:
+        issues = []
+        for p in c["pillars"]:
+            for d in p["deductions"]:
+                if p["pillar"] == "email_dns" and d["type"] != "dns-takeover":
+                    continue
+                info = sc.ISSUE_TYPES.get(d["type"]) or {}
+                issue = {"type": d["type"], "title": info.get("title") or d["type"],
+                         "label": d["label"], "severity": info.get("severity", "low"),
+                         "factor": p["pillar"], "points": d["points"], "detail": d.get("detail", "")}
+                if "gain" in d:
+                    issue["gain"] = d["gain"]
+                issues.append(issue)
+        issues.sort(key=lambda i: (_SEV_RANK.get(i["severity"], 9), -i["points"]))
+        counts = defaultdict(int)
+        for i in issues:
+            counts[i["severity"]] += 1
+        rows.append({
+            "host": c["host"], "domain": c["parent"],
+            "score": None if c["unknown"] else c["score"], "grade": c["grade"],
+            "coverage": c["coverage"], "confidence": c["confidence"], "unknown": c["unknown"],
+            "critical_exposure": bool(c.get("critical_exposure")),
+            "critical_cap": c.get("critical_cap"), "coverage_cap": c.get("coverage_cap"),
+            "factors": {p["pillar"]: p.get("score") for p in c["pillars"]},
+            "notes": {p["pillar"]: p.get("note") for p in c["pillars"]},
+            "issues": issues if only else issues[:12],
+            "issue_counts": dict(counts),
+            "open_ports": sorted((services.get(c["host"]) or {}).get("open") or {}, key=lambda p: int(p) if str(p).isdigit() else 0),
+            "open_findings": open_by_host.get(c["host"], 0),
+        })
+    rated = [r for r in rows if not r["unknown"]]
+    by_grade = defaultdict(int)
+    for r in rows:
+        by_grade[r["grade"]] += 1
+    return {"hosts": rows, "summary": {"hosts": len(rows), "rated": len(rated),
+                                       "by_grade": dict(sorted(by_grade.items())),
+                                       "with_critical": sum(1 for r in rows if r["critical_exposure"])}}
+
+
+def hosts(org=DEFAULT_ORG, only=None):
+    fs, _, _, meta = copy.deepcopy(_cached_org_data(org))
+    result = hosts_from_snapshot((REGISTRY.get(org) or {}).get("domains") or [], meta, fs, only=only)
+    result["scanned"] = meta.get("date") or ""
+    return result
+
+
+def scorecard(org=DEFAULT_ORG, explain=True):
+    # One cache read keeps findings and evidence from the same scan.
+    fs, _, _, meta = copy.deepcopy(_cached_org_data(org))
+    result = scorecard_from_snapshot((REGISTRY.get(org) or {}).get("domains") or [],
+                                     meta, fs, explain=explain)
+    import posture
+    result["progress"] = posture.progress(result.pop("snapshot"), load_history(org))
+    return result
+
+
+def scorecard_plan(org=DEFAULT_ORG, fix=()):
+    """Score planner: the org rating with the given issue types treated as fixed.
+
+    Both sides come from one snapshot through the same model, so the
+    projection differs from the live rating only by the selected fixes.
+    """
+    fs, _, _, meta = copy.deepcopy(_cached_org_data(org))
+    domains = (REGISTRY.get(org) or {}).get("domains") or []
+    before = scorecard_from_snapshot(domains, meta, fs, explain=False)
+    after = scorecard_from_snapshot(domains, meta, fs, exclude=fix, explain=False)
+    return {
+        "fix": sorted(set(fix)),
+        "before": before["summary"], "after": after["summary"],
+        "domains": [{"domain": b["domain"], "unknown": b["unknown"],
+                     "before": b["score"], "after": a["score"],
+                     "grade_before": b["grade"], "grade_after": a["grade"]}
+                    for b, a in zip(before["domains"], after["domains"])],
+    }
+
+
+def portfolio():
+    """Every registered org's rating side by side — read-only, like
+    scorecard(): no history is written and nothing is rescanned."""
+    rows = []
+    for slug in sorted(REGISTRY):
+        org = REGISTRY.get(slug) or {}
+        row = {"slug": slug, "name": org.get("name") or slug,
+               "domains": len(org.get("domains") or [])}
+        try:
+            data = scorecard(slug, explain=False)
+        except Exception as e:
+            row["error"] = type(e).__name__
+            rows.append(row)
+            continue
+        severities = {}
+        for issue in data.get("issues") or []:
+            severities[issue["severity"]] = severities.get(issue["severity"], 0) + issue["count"]
+        progress = data.get("progress") or {}
+        trend = progress.get("trend") or []
+        # A tiny sparkline has no room to explain changing populations. Show
+        # only its latest comparable segment; the overview retains all points.
+        segment = []
+        for point in trend:
+            if point.get("break_before"):
+                segment = []
+            segment.append(point["score"])
+        row.update(scanned=data.get("scanned") or "", summary=data["summary"],
+                   issues=severities, trend=segment,
+                   changes=[c for c in progress.get("changes") or [] if c.get("comparable")])
+        rows.append(row)
+    return {"orgs": rows}
 
 
 if __name__ == "__main__":

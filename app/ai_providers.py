@@ -1,11 +1,15 @@
 """ai_providers.py — configurable AI provider layer.
 
-Supports two providers:
+Supports three providers:
   - ollama (native): POST {base_url}/api/chat {model, messages, stream:false}
   - openai-compatible: POST {base_url}/chat/completions {model, messages, temperature:0}
+  - codex-cli: the locally signed-in Codex CLI (`codex exec`), which is how a
+    ChatGPT subscription is used — there is no HTTP API for a ChatGPT plan
 
 Global profiles live in data/ai_config.json (or CTI_AI_CONFIG JSON / CTI_AI_CONFIG_FILE).
 Secrets are referenced via env names (api_key_env) — never stored in the JSON.
+Built-in PRESETS (OpenCode Go, OpenCode Zen, DeepSeek, Codex) appear as
+profiles on their own once their credential exists.
 
 Per-org selection is stored as `ai_profile` in data/orgs.json (server-managed).
 Capabilities endpoint exposes only safe fields (no base_url/secrets).
@@ -14,6 +18,9 @@ import ipaddress
 import json
 import os
 import re
+import shutil
+import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -30,6 +37,63 @@ DEFAULT_CONFIG_PATH = os.path.join(DATA_ROOT, "ai_config.json")
 ORG_PROFILES_PATH = os.path.join(DATA_ROOT, "ai_org_profiles.json")
 
 VALID_PROVIDERS = ("ollama", "openai-compatible")
+
+# Built-in providers. Endpoints and model ids follow each vendor's docs as of
+# 2026-10-23; only models served on an OpenAI chat-completions endpoint are
+# listed, because that is the protocol this module speaks. A preset becomes a
+# profile when its credential exists; an ai_config.json profile of the same
+# name always wins.
+PRESETS = {
+    "opencode-go": {
+        "label": "OpenCode Go",
+        "plan": "Subscription",
+        "provider": "openai-compatible",
+        "base_url": "https://opencode.ai/inference/go/openai/v1",
+        "key_envs": ("OPENCODE_GO_API_KEY", "OPENCODE_GO_B_API_KEY"),
+        "model": "glm-5.3",
+        "models": ("glm-5.3", "glm-5.3-flash", "kimi-k3", "kimi-k2.7-code",
+                   "deepseek-v4-pro", "deepseek-v4.1-flash", "mimo-v2.6-pro",
+                   "minimax-m3.1-flash"),
+        "docs": "https://opencode.ai/docs/go/",
+        "connect": "Subscribe to Go in the OpenCode console, copy the API key and "
+                   "set OPENCODE_GO_API_KEY in the server environment.",
+    },
+    "opencode-zen": {
+        "label": "OpenCode Zen",
+        "plan": "Pay as you go",
+        "provider": "openai-compatible",
+        "base_url": "https://opencode.ai/inference/openai/v1",
+        "key_envs": ("OPENCODE_API_KEY",),
+        "model": "kimi-k3",
+        "models": ("kimi-k3", "glm-5.3", "deepseek-v4-pro", "qwen3.8-max",
+                   "minimax-m3", "mistral-large-4", "kimi-k2.7-code"),
+        "docs": "https://opencode.ai/docs/zen/",
+        "connect": "Add credit in the OpenCode console, copy the API key and set "
+                   "OPENCODE_API_KEY in the server environment.",
+    },
+    "deepseek": {
+        "label": "DeepSeek",
+        "plan": "Pay as you go",
+        "provider": "openai-compatible",
+        "base_url": "https://api.deepseek.com",
+        "key_envs": ("DEEPSEEK_API_KEY",),
+        "model": "deepseek-v4-pro",
+        "models": ("deepseek-v4-pro", "deepseek-flash"),
+        "docs": "https://api-docs.deepseek.com/",
+        "connect": "Create a key on the DeepSeek platform and set DEEPSEEK_API_KEY "
+                   "in the server environment.",
+    },
+    "codex": {
+        "label": "Codex (ChatGPT plan)",
+        "plan": "ChatGPT subscription",
+        "provider": "codex-cli",
+        "model": "gpt-6.1-sol",
+        "models": ("gpt-6.1-sol", "gpt-6-luna"),
+        "docs": "https://learn.chatgpt.com/docs/auth",
+        "connect": "Install the Codex CLI for the user that runs this server and sign "
+                   "in with `codex login --device-auth` (or `codex login`).",
+    },
+}
 SEVERITY_ALLOWED = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
 CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,7}$")
 PROMPT_VERSION = "cti-v1"
@@ -253,10 +317,89 @@ def load_profiles() -> Tuple[Dict[str, dict], Optional[str]]:
             "cap_retry": bool(p.get("cap_retry", True)),
             "options": options,
         }
+    for name, preset in PRESETS.items():
+        if name not in norm:
+            prof = _preset_profile(name, preset)
+            if prof:
+                norm[name] = prof
     # validate default
     if default not in norm:
         default = next(iter(norm), None) if norm else None
     return norm, default
+
+
+def preset_key_env(preset: dict) -> Optional[str]:
+    """The first of a preset's key variables that is set, if any."""
+    for env in preset.get("key_envs") or ():
+        if os.environ.get(env, "").strip():
+            return env
+    return None
+
+
+def codex_bin() -> Optional[str]:
+    """Path to the Codex CLI: CTI_CODEX_BIN, else `codex` on PATH."""
+    p = os.environ.get("CTI_CODEX_BIN", "").strip()
+    if p:
+        return p if os.path.isfile(p) and os.access(p, os.X_OK) else None
+    return shutil.which("codex")
+
+
+def _preset_profile(name: str, preset: dict) -> Optional[dict]:
+    """A normalized profile for a preset whose credential is present.
+
+    Preset endpoints are code constants (https, public), so they skip the
+    DNS-based URL validation that guards operator-supplied base URLs.
+    """
+    base = {"timeout": 120, "max_hosts": 10, "max_tokens": 3072, "cap_retry": True,
+            "options": {}, "preset": name, "label": preset["label"]}
+    if preset["provider"] == "codex-cli":
+        if not codex_bin():
+            return None
+        return dict(base, provider="codex-cli", base_url="", model=preset["model"],
+                    api_key_env=None, timeout=180)
+    env = preset_key_env(preset)
+    if not env:
+        return None
+    return dict(base, provider=preset["provider"], base_url=preset["base_url"],
+                model=preset["model"], api_key_env=env)
+
+
+_codex_status_cache = {"at": 0.0, "value": None}
+
+
+def codex_login_status(max_age: float = 60.0) -> dict:
+    """{installed, signed_in, method} from `codex login status` (cached).
+
+    Only the first line is kept and e-mail addresses are removed, so account
+    details never reach the browser.
+    """
+    binp = codex_bin()
+    if not binp:
+        return {"installed": False, "signed_in": False, "method": None}
+    now = time.time()
+    if _codex_status_cache["value"] and now - _codex_status_cache["at"] < max_age:
+        return _codex_status_cache["value"]
+    try:
+        r = subprocess.run([binp, "login", "status"], capture_output=True, text=True,
+                           timeout=15, env=_agent_env(), stdin=subprocess.DEVNULL)
+        line = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
+        line = re.sub(r"[\w.%+-]+@[\w.-]+", "", line[0] if line else "").strip()[:80]
+        value = {"installed": True, "signed_in": r.returncode == 0 and "logged in" in line.lower(),
+                 "method": line or None}
+    except Exception as e:
+        value = {"installed": True, "signed_in": False, "method": type(e).__name__}
+    _codex_status_cache.update(at=now, value=value)
+    return value
+
+
+def _agent_env() -> dict:
+    """Environment for agent CLIs: none of this server's secrets.
+
+    The agent only needs HOME/PATH (and CODEX_HOME for its own sign-in);
+    API keys, tokens and passwords of the dashboard are stripped.
+    """
+    secret = re.compile(r"(^CTI_)|(_API_KEY$)|(TOKEN)|(PASSWORD)|(SECRET)", re.I)
+    return {k: v for k, v in os.environ.items() if not secret.search(k)}
 
 # ---------------------------------------------------------------------------
 # provider calls
@@ -527,13 +670,75 @@ def _call_openai_compatible(base_url: str, model: str, prompt: str, timeout: int
     return content, reasoning_out, diag
 
 
-def call_ai(prompt: str, profile_name: Optional[str] = None) -> Tuple[Optional[str], Optional[dict]]:
-    """Call configured AI profile. Returns (content_str or None, provenance dict or None)."""
+_CODEX_OUTPUT_MAX = 200_000
+
+
+def _call_codex_cli(prompt: str, timeout: int, model: Optional[str] = None):
+    """Run one non-interactive Codex turn. Returns (content, reasoning, diagnostics).
+
+    The agent runs read-only in an empty scratch directory, without the
+    user's config.toml (so no personal MCP servers or rules load), without
+    persisting a session, and without any of this server's secrets in its
+    environment. The prompt goes over stdin; the final message is read from
+    the -o file. Sign-in comes from CODEX_HOME (`codex login`).
+    """
+    binp = codex_bin()
+    if not binp:
+        return None, None, {"error": "codex CLI not found (install it or set CTI_CODEX_BIN)"}
+    with tempfile.TemporaryDirectory(prefix="parallax-codex-") as scratch:
+        out = os.path.join(scratch, "last-message.txt")
+        cmd = [binp, "exec", "--sandbox", "read-only", "--skip-git-repo-check",
+               "--ephemeral", "--ignore-user-config", "--ignore-rules",
+               "--color", "never", "-C", scratch, "-o", out]
+        if model:
+            cmd += ["-m", model]
+        cmd.append("-")
+        proc = None
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, cwd=scratch,
+                                    env=_agent_env(), start_new_session=True)
+            _, err = proc.communicate(prompt, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if proc is not None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    proc.kill()
+                proc.communicate()
+            _log("warn", f"codex exec timed out after {timeout}s")
+            return None, None, {"error": f"codex timed out after {timeout}s"}
+        except Exception as e:
+            _log("error", f"codex exec failed: {type(e).__name__}: {e}")
+            return None, None, {"error": f"{type(e).__name__}: {e}"}
+        if proc.returncode != 0:
+            tail = re.sub(r"[\w.%+-]+@[\w.-]+", "<email>", (err or "").strip())[-300:]
+            _log("error", f"codex exec exit {proc.returncode}: {tail}")
+            return None, None, {"error": f"codex exited with {proc.returncode}", "response_excerpt": tail}
+        try:
+            with open(out, encoding="utf-8", errors="replace") as f:
+                content = f.read(_CODEX_OUTPUT_MAX).strip()
+        except OSError:
+            content = ""
+        if not content:
+            return None, None, {"error": "codex returned no final message"}
+        return content, None, {}
+
+
+def call_ai(prompt: str, profile_name: Optional[str] = None,
+            model: Optional[str] = None) -> Tuple[Optional[str], Optional[dict]]:
+    """Call configured AI profile. Returns (content_str or None, provenance dict or None).
+
+    `model` overrides the profile's model for this call; callers validate it
+    (see allowed_models).
+    """
     profiles, default = load_profiles()
     name = profile_name or default
     if not name or name not in profiles:
         return None, None
-    prof = profiles[name]
+    prof = dict(profiles[name])
+    if model:
+        prof["model"] = model
     provider = prof["provider"]
     content = None
     reasoning = None
@@ -545,10 +750,12 @@ def call_ai(prompt: str, profile_name: Optional[str] = None) -> Tuple[Optional[s
             prof["base_url"], prof["model"], prompt, prof["timeout"],
             prof["api_key_env"], max_tokens=prof.get("max_tokens", 1024),
             cap_retry=prof.get("cap_retry", True))
+    elif provider == "codex-cli":
+        content, reasoning, diag = _call_codex_cli(prompt, prof["timeout"], prof["model"] or None)
     provenance = {
         "profile": name,
         "provider": provider,
-        "model": prof["model"],
+        "model": prof["model"] or "codex default",
         "prompt_version": PROMPT_VERSION,
     }
     if diag:
@@ -746,14 +953,67 @@ def get_capabilities() -> dict:
                 ready = False
         caps.append({
             "name": name,
+            "label": p.get("label") or name,
             "provider": p["provider"],
-            "model": p["model"],
+            "model": p["model"] or "codex default",
             "timeout": p["timeout"],
             "max_hosts": p["max_hosts"],
             "ready": ready,
             "default": name == default,
         })
     return {"default_profile": default, "profiles": caps, "prompt_version": PROMPT_VERSION}
+
+
+def allowed_models(profile_name: str) -> Tuple[str, ...]:
+    """Models a caller may select for a profile: a preset's list, else its own model."""
+    profiles, _ = load_profiles()
+    prof = profiles.get(profile_name)
+    if not prof:
+        return ()
+    preset = PRESETS.get(prof.get("preset") or "")
+    if preset and preset["models"]:
+        return tuple(preset["models"])
+    return (prof["model"],) if prof["model"] else ()
+
+
+def provider_catalog() -> dict:
+    """Every supported provider with connection status, for the settings UI.
+
+    Safe for the browser: env variable NAMES, never values; no base URLs for
+    operator-defined profiles.
+    """
+    profiles, default = load_profiles()
+    out = []
+    for name, preset in PRESETS.items():
+        prof = profiles.get(name)
+        row = {"id": name, "label": preset["label"], "plan": preset["plan"],
+               "kind": preset["provider"], "docs": preset["docs"],
+               "connect": preset["connect"], "models": list(preset["models"]),
+               "model": (prof or {}).get("model") or preset["model"] or "codex default",
+               "configured_by": "ai_config.json" if prof and not prof.get("preset") else "preset",
+               "default": name == default}
+        if preset["provider"] == "codex-cli":
+            st = codex_login_status()
+            row.update(connected=bool(prof) and st["signed_in"], installed=st["installed"],
+                       status=st["method"] or ("Not installed" if not st["installed"] else "Not signed in"),
+                       key_env=None)
+        else:
+            env = preset_key_env(preset)
+            row.update(connected=bool(prof), key_env=env or preset["key_envs"][0],
+                       status=("Key found in " + env) if env else "No API key set")
+        out.append(row)
+    for name, p in profiles.items():
+        if name in PRESETS:
+            continue
+        ready = not (p["provider"] == "openai-compatible" and p["api_key_env"]
+                     and not os.environ.get(p["api_key_env"], "").strip())
+        out.append({"id": name, "label": name, "plan": "Custom profile", "kind": p["provider"],
+                    "docs": None, "connect": "Defined in ai_config.json.", "models": [p["model"]],
+                    "model": p["model"], "configured_by": "ai_config.json",
+                    "connected": ready, "key_env": p["api_key_env"],
+                    "status": "Ready" if ready else "Key variable not set",
+                    "default": name == default})
+    return {"providers": out, "default_profile": default}
 
 _org_profiles_lock = threading.Lock()
 

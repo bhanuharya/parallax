@@ -1,11 +1,11 @@
-# CTI Radar — Deployment Guide
+# Parallax — Deployment Guide
 
 This document describes the **supported deployment shape** and its hardening
 notes. For day-to-day operation see the `README.md` setup section.
 
 ## Supported shape: single process, single host
 
-CTI Radar is architected around **one server process on one host**:
+Parallax (formerly CTI Radar) is architected around **one server process on one host**:
 
 - Registry, findings, baseline, and history are JSON files guarded by
   **process-local** locks (`cc._org_lock`). Two processes writing the same
@@ -34,7 +34,7 @@ surface already supports that transition.
 
 ```ini
 [Unit]
-Description=CTI Radar Correlation Dashboard (FastAPI, tailnet-only)
+Description=Parallax external posture dashboard (FastAPI, tailnet-only)
 After=network.target
 
 [Service]
