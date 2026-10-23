@@ -26,6 +26,7 @@ Rules, matching the rest of the app's AI handling:
 import json
 import re
 import time
+import uuid
 
 import ai_providers
 import cti_correlation as cc
@@ -401,7 +402,9 @@ def _verify(cites, answer, known):
 def ask(org, question, profile, model=None, history=(), call=None):
     """Answer one question. `call(prompt) -> (content, provenance)` is injectable for tests."""
     started = time.time()
-    call = call or (lambda prompt: ai_providers.call_ai(prompt, profile_name=profile, model=model))
+    session = uuid.uuid4().hex  # one id for every step of this question
+    call = call or (lambda prompt: ai_providers.call_ai(prompt, profile_name=profile, model=model,
+                                                        session=session))
     data = OrgData(org)
     ctx = context(data)
     history = [{"q": str(h.get("q") or "")[:600], "a": str(h.get("a") or "")[:1500]}

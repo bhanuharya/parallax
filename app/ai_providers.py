@@ -28,6 +28,7 @@ import time
 import urllib.error
 import urllib.parse as _urlparse
 import urllib.request
+import uuid
 from typing import Dict, List, Optional, Tuple
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -101,6 +102,16 @@ PROMPT_VERSION = "cti-v1"
 _ALLOWED_API_KEY_RE = re.compile(r"^(CTI_AI_[A-Z0-9_]+|OPENCODE_GO_B_API_KEY|OPENROUTER_API_KEY|[A-Z][A-Z0-9_]*_API_KEY)$")
 
 _USER_AGENT = "cti-radar/1.0 (urllib)"
+
+# OpenCode's gateways reject requests without a stable `x-opencode-session`
+# (https://opencode.ai/docs/go/#where-can-i-use-it). Callers that hold a
+# conversation pass their own id; everything else shares this process id.
+_PROCESS_SESSION = uuid.uuid4().hex
+
+
+def _is_opencode_url(url: str) -> bool:
+    host = (_urlparse.urlparse(url).hostname or "").lower()
+    return host == "opencode.ai" or host.endswith(".opencode.ai")
 
 # Optional log hook so the web backend can route AI diagnostics into the
 # persisted runtime log (JSONL) + in-memory ring. Falls back to stderr.
@@ -563,7 +574,7 @@ def _call_ollama(base_url: str, model: str, prompt: str, timeout: int, options: 
 
 def _call_openai_compatible(base_url: str, model: str, prompt: str, timeout: int,
                             api_key_env: Optional[str], max_tokens: int = 1024,
-                            cap_retry: bool = True):
+                            cap_retry: bool = True, session: Optional[str] = None):
     """Call an OpenAI-compatible endpoint. Returns (content, reasoning, diagnostics).
 
     Requests structured JSON output (``response_format: json_object``) and caps
@@ -590,6 +601,8 @@ def _call_openai_compatible(base_url: str, model: str, prompt: str, timeout: int
         req.add_header("User-Agent", _USER_AGENT)
         if key:
             req.add_header("Authorization", "Bearer " + key)
+        if _is_opencode_url(url):
+            req.add_header("x-opencode-session", session or _PROCESS_SESSION)
         with _urlopen_no_redirect(req, timeout=timeout) as r:
             resp_bytes = _limited_read(r)
             status = getattr(r, "status", None)
@@ -748,11 +761,13 @@ def _call_codex_cli(prompt: str, timeout: int, model: Optional[str] = None):
 
 
 def call_ai(prompt: str, profile_name: Optional[str] = None,
-            model: Optional[str] = None) -> Tuple[Optional[str], Optional[dict]]:
+            model: Optional[str] = None,
+            session: Optional[str] = None) -> Tuple[Optional[str], Optional[dict]]:
     """Call configured AI profile. Returns (content_str or None, provenance dict or None).
 
     `model` overrides the profile's model for this call; callers validate it
-    (see allowed_models).
+    (see allowed_models). `session` is a stable conversation id for providers
+    that route on it (OpenCode).
     """
     profiles, default = load_profiles()
     name = profile_name or default
@@ -771,7 +786,7 @@ def call_ai(prompt: str, profile_name: Optional[str] = None,
         content, reasoning, diag = _call_openai_compatible(
             prof["base_url"], prof["model"], prompt, prof["timeout"],
             prof["api_key_env"], max_tokens=prof.get("max_tokens", 1024),
-            cap_retry=prof.get("cap_retry", True))
+            cap_retry=prof.get("cap_retry", True), session=session)
     elif provider == "codex-cli":
         content, reasoning, diag = _call_codex_cli(prompt, prof["timeout"], prof["model"] or None)
     provenance = {
