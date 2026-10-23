@@ -845,6 +845,23 @@ def normalize_finding(f, org=DEFAULT_ORG, meta_date=None):
     return nf
 
 
+_SUMMARY_MAX = 240
+
+
+def _list_summary(description):
+    """Masked one-paragraph description for list cards, capped for payload size."""
+    if not description:
+        return None
+    s = " ".join(str(description).split())
+    # AI findings store the model's reason as a JSON-quoted string
+    if s.startswith('"'):
+        s = s[1:].removesuffix('"')
+    s = _mask_value("description", s)
+    if len(s) > _SUMMARY_MAX:
+        s = s[:_SUMMARY_MAX].rsplit(" ", 1)[0].rstrip(",;:") + "…"
+    return s or None
+
+
 def normalize_finding_light(f, org=DEFAULT_ORG, meta_date=None):
     """Lightweight list-view normalization (small payload, no deep PII scan).
 
@@ -886,6 +903,8 @@ def normalize_finding_light(f, org=DEFAULT_ORG, meta_date=None):
         "confidence": confidence,
         "target": nf.get("target"),
         "ip": nf.get("ip"),
+        "port": nf.get("port"),
+        "summary": _list_summary(nf.get("description")),
         "found_date": nf.get("found_date"),
         "first_seen": nf.get("first_seen"),
         "last_seen": nf.get("last_seen"),

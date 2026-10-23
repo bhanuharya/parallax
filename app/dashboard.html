@@ -417,6 +417,12 @@
   .ftitle { margin:0; font-size:14.5px; font-weight:600; flex:1 1 240px; min-width:0; overflow-wrap:anywhere; }
   .fview { margin-left:auto; color:var(--accent-ink); font-size:12.5px; font-weight:500; cursor:pointer; padding:2px 6px; border-radius:6px; }
   .fview:hover { background:var(--accent-wash); }
+  .fsub { margin-top:6px; padding-left:24px; display:flex; flex-wrap:wrap; align-items:baseline; gap:2px 14px; font-size:12.5px; color:var(--text-2); min-width:0; }
+  .fsub .host { font-family:var(--mono); color:var(--text); overflow-wrap:anywhere; }
+  .fsub .mono { font-family:var(--mono); }
+  .fsum { margin:4px 0 0; padding-left:24px; font-size:13px; line-height:1.45; color:var(--text-2);
+          display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; overflow-wrap:anywhere; }
+  .fcard:not(.collapsed) .fsum { -webkit-line-clamp:unset; }
   .fbody { margin-top:10px; padding-left:24px; }
   .fcard.collapsed .fbody { display:none; }
   .fcat { color:var(--text-2); font-size:12.5px; }
@@ -3924,11 +3930,17 @@ function findingCard(f) {
   const srcHtml = sourceLinksHtml(f);
   const target = f.target && f.target !== 'None' ? f.target : '';
   const ip = f.ip && f.ip !== 'None' ? f.ip : '';
+  const port = f.port != null && f.port !== '' ? String(f.port) : '';
+  // always-visible "where and what": host:port, ip, category, date
+  const sub = [];
+  if (target) sub.push('<span class="host">' + esc(target) + (port ? ':' + esc(port) : '') + '</span>');
+  else if (port) sub.push('<span class="mono">port ' + esc(port) + '</span>');
+  if (ip) sub.push('<span class="mono ip">' + esc(ip) + '</span>');
+  if (f.category) sub.push('<span>' + esc(f.category) + '</span>');
+  if (f.found_date) sub.push('<span>found ' + esc(f.found_date) + '</span>');
   const meta = [];
-  if (target) meta.push('<div class="mrow"><span class="mlabel">host</span><span class="mval host">' + esc(target) + '</span></div>');
-  if (ip) meta.push('<div class="mrow"><span class="mlabel">ip</span><span class="mval ip">' + esc(ip) + '</span></div>');
-  if (f.found_date) meta.push('<div class="mrow"><span class="mlabel">found</span><span class="mval">' + esc(f.found_date) + '</span></div>');
   if (f.first_seen) meta.push('<div class="mrow"><span class="mlabel">first</span><span class="mval">' + esc(f.first_seen) + '</span></div>');
+  if (f.last_seen) meta.push('<div class="mrow"><span class="mlabel">last</span><span class="mval">' + esc(f.last_seen) + '</span></div>');
   if (srcHtml) meta.push('<div class="mrow"><span class="mlabel">src</span><span class="mval">' + srcHtml + '</span></div>');
   return '<div class="fcard collapsed" data-id="' + esc(f.id) + '">' +
     '<div class="fhead" role="button" tabindex="0" aria-expanded="false">' +
@@ -3943,8 +3955,9 @@ function findingCard(f) {
       positivePill(f) +
       '<span class="fview" role="button" tabindex="0">Details</span>' +
     '</div>' +
+    (sub.length ? '<div class="fsub">' + sub.join('') + '</div>' : '') +
+    (f.summary ? '<p class="fsum">' + esc(f.summary) + '</p>' : '') +
     '<div class="fbody">' +
-      (f.category ? '<div class="fcat">' + esc(f.category) + '</div>' : '') +
       cveHtml +
       (meta.length ? '<div class="fmeta">' + meta.join('') + '</div>' : '') +
       (target ? '<div style="margin-top:6px"><button class="btn ghost" data-vuln-target="' + esc(target) + '" type="button" title="Vuln lookup for this host (CVE + config audit, passive)">vuln: this host</button></div>' : '') +
