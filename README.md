@@ -51,7 +51,7 @@ The posture features run on the Python backend. Keep scan data in a folder
 outside the checkout; the tracked `data/orgs.json` is a public sample.
 
 ```bash
-git clone https://github.com/bhanuharya/cti-radar.git && cd cti-radar
+git clone https://github.com/bhanuharya/parallax.git && cd parallax
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 mkdir -p ~/.local/share/cti-radar
 
