@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/parallax-logo-dark.svg">
+    <img src="assets/parallax-logo.svg" alt="Parallax" width="480">
+  </picture>
+</p>
+
 # Parallax — External Posture & Dependency Intelligence
 
 **See your attack surface the way the internet does.** Parallax is a
