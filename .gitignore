@@ -48,6 +48,12 @@ data/ai_org_profiles.json
 preview-*.png
 dashboard-preview.png
 
-
 # ---- coding-agent session hook state ----
 /.mimosa/
+
+# ---- rust rewrite build artifacts ----
+rust/target/
+bench/results/
+
+# ---- local agent state ----
+/.agent/

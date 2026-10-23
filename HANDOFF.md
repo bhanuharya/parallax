@@ -1,5 +1,28 @@
 # Handoff — Asset Inventory & Scorecard Cycle
 
+## Merge of origin/main (2026-10-23)
+
+`feat/parallax-platform` merges `origin/main` (Rust rewrite, AI-config CRUD,
+passive/Nuclei vuln lookup, benchmarks). Conflicts and how they were settled:
+- `app/dashboard.html`: the new UI wins; main's features were ported into it
+  (Workspace → Vulnerability lookup with one engine select and one button,
+  fixing main's duplicate `vulnengine` id; AI assistant → Custom models for
+  the profile editor; GLM 5.3 Flash as the OpenHack default). Main's login
+  `value="admin"` was dropped on purpose (see the login follow-up below).
+- `README.md`: Parallax intro plus a "Two backends" note. **The posture
+  features (ratings, hosts, planner, packages, live CVEs, AI assistant,
+  portfolio) exist only in the Python backend.** The Rust binary embeds this
+  dashboard; on a backend without `/api/posture` the overview says so instead
+  of loading forever. Porting them to Rust is open work.
+- `data/ai_config.example.json`: main's `cline` example kept (OpenCode is now a
+  built-in preset). `.gitignore`: both sides' additions kept.
+- `app/cve_data.json` is also embedded by Rust; its parser is lenient JSON, so
+  MEDIUM severities, `null` fix versions and the new `withdrawn` key are safe
+  (checked by reading `rust/src/cve_match.rs`; no Rust toolchain here to build).
+Validation after the merge: 569 Python tests (including main's AI-config,
+Nuclei and vuln-scan suites), dashboard JS checks, and both merged views in a
+browser.
+
 ## Follow-up: host ratings and two false positives (2026-10-23, evening)
 
 Triggered by an assistant transcript on a real org: it could not name the
