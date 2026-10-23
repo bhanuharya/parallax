@@ -190,6 +190,36 @@ def test_classification_parser_salvages_truncated_batch():
     assert out[0]["verdict"] == "confirm"
 
 
+def test_opencode_requests_carry_a_stable_session_header(monkeypatch):
+    """OpenCode rejects requests without x-opencode-session (MissingSessionID)."""
+    sent = []
+
+    def fake_urlopen(req, timeout=30):
+        sent.append(req.get_header("X-opencode-session"))
+        return _FakeResp(_ok_body('{"ok":true}'))
+
+    monkeypatch.setattr(ai_providers, "_urlopen_no_redirect", fake_urlopen)
+    url = "https://opencode.ai/inference/go/openai/v1"
+    ai_providers._call_openai_compatible(url, "glm", "p", 30, None)
+    ai_providers._call_openai_compatible(url, "glm", "p", 30, None)
+    ai_providers._call_openai_compatible(url, "glm", "p", 30, None, session="conv-1")
+    assert sent[0] and sent[0] == sent[1]   # same process id across calls
+    assert sent[2] == "conv-1"
+
+
+def test_session_header_not_sent_to_other_providers(monkeypatch):
+    seen = []
+
+    def fake_urlopen(req, timeout=30):
+        seen.append(req.get_header("X-opencode-session"))
+        return _FakeResp(_ok_body('{"ok":true}'))
+
+    monkeypatch.setattr(ai_providers, "_urlopen_no_redirect", fake_urlopen)
+    for url in ("https://api.deepseek.com", "https://opencode.ai.evil.example/v1"):
+        ai_providers._call_openai_compatible(url, "m", "p", 30, None, session="conv-1")
+    assert seen == [None, None]
+
+
 def test_classification_salvage_still_enforces_target_whitelist():
     raw = '{"results":[{"target":"evil.example.net","verdict":"confirm","severity":"HIGH"}]}'
     # contract: empty list (falsy) when every item is filtered out

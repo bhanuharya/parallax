@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 584 160" width="584" height="160" role="img" aria-labelledby="t">
+  <title id="t">Parallax — external posture &amp; dependency intelligence</title>
+  <!-- dark-background variant of parallax-logo.svg -->
+  <g transform="translate(8 8) scale(0.75)">
+    <rect width="192" height="192" rx="44" fill="#3987e5"/>
+    <path d="M96 56.2 A45 45 0 0 1 96 135.8 A45 45 0 0 1 96 56.2 Z" fill="#ffffff" fill-opacity="0.22"/>
+    <circle cx="75" cy="96" r="45" fill="none" stroke="#ffffff" stroke-width="13"/>
+    <circle cx="117" cy="96" r="45" fill="none" stroke="#ffffff" stroke-width="13"/>
+    <circle cx="96" cy="96" r="13" fill="#ffffff"/>
+  </g>
+  <g font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <text x="180" y="92" font-size="64" font-weight="700" letter-spacing="-1.5" fill="#f0efec">Parallax</text>
+    <text x="182" y="126" font-size="20" font-weight="500" fill="#c3c2b7">External posture &amp; dependency intelligence</text>
+  </g>
+</svg>

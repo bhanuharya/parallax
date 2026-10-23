@@ -417,6 +417,12 @@
   .ftitle { margin:0; font-size:14.5px; font-weight:600; flex:1 1 240px; min-width:0; overflow-wrap:anywhere; }
   .fview { margin-left:auto; color:var(--accent-ink); font-size:12.5px; font-weight:500; cursor:pointer; padding:2px 6px; border-radius:6px; }
   .fview:hover { background:var(--accent-wash); }
+  .fsub { margin-top:6px; padding-left:24px; display:flex; flex-wrap:wrap; align-items:baseline; gap:2px 14px; font-size:12.5px; color:var(--text-2); min-width:0; }
+  .fsub .host { font-family:var(--mono); color:var(--text); overflow-wrap:anywhere; }
+  .fsub .mono { font-family:var(--mono); }
+  .fsum { margin:4px 0 0; padding-left:24px; font-size:13px; line-height:1.45; color:var(--text-2);
+          display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; overflow-wrap:anywhere; }
+  .fcard:not(.collapsed) .fsum { -webkit-line-clamp:unset; }
   .fbody { margin-top:10px; padding-left:24px; }
   .fcard.collapsed .fbody { display:none; }
   .fcat { color:var(--text-2); font-size:12.5px; }
@@ -777,11 +783,11 @@
         <div class="card" id="host-section">
           <div class="cardhead"><h2>Hosts <span class="count" id="hostcount"></span></h2>
             <div class="toolbar">
-              <select class="sortsel" id="host-domain" aria-label="Filter hosts by domain"><option value="">All domains</option></select>
+              <select class="sortsel" id="host-domain" aria-label="Filter hosts by domain"><option value="">All domains &amp; ranges</option></select>
               <input class="search" id="host-search" type="search" placeholder="Filter hosts" aria-label="Filter hosts">
             </div>
           </div>
-          <p class="dim" style="font-size:12.5px;margin:-6px 0 12px">Same rating model as domains, using only the host's own evidence plus its domain's email &amp; DNS posture. Critical exposure first, then weakest; hosts with too little evidence to rate come last.</p>
+          <p class="dim" style="font-size:12.5px;margin:-6px 0 12px">Same rating model as domains, using only the host's own evidence plus its domain's email &amp; DNS posture (addresses from IP ranges have none, so that factor stays unknown). Critical exposure first, then weakest; hosts with too little evidence to rate come last.</p>
           <div class="table-scroll"><table class="datatable"><thead><tr><th>Rating</th><th>Host</th><th>Main issues</th><th class="num">Coverage</th><th class="num">Open findings</th></tr></thead><tbody id="host-rows"></tbody></table></div>
         </div>
         <div class="card" id="cert-section">
@@ -983,6 +989,9 @@
               <div class="inline"><input id="no-domains" autocomplete="off" spellcheck="false" placeholder="acme.com example.com">
                 <button class="btn primary" id="no-create" type="button">Create</button><button class="btn" id="no-cancel" type="button">Cancel</button></div>
               <small>Up to 20 domains you own or are authorized to assess, separated by spaces, commas or new lines.</small></div>
+            <div class="field wide"><label for="no-ranges">IP ranges <span class="dim">(optional)</span></label>
+              <input id="no-ranges" autocomplete="off" spellcheck="false" placeholder="e.g. 1.2.3.0/24 1.2.4.9">
+              <small>Public IPv4 CIDR blocks (a bare IP is a /32), up to 2,048 addresses (one /21) by default (set CTI_MAX_RANGE_IPS for more, up to 65,536). Every address gets a TCP connect check of common ports, so list only ranges you own or are cleared to test.</small></div>
           </div>
         </div>
         <div class="card">
@@ -992,6 +1001,13 @@
             <div class="inline"><input id="ws-domains" autocomplete="off" spellcheck="false" placeholder="acme.com example.com">
               <button class="btn" id="ws-add-domain" type="button">Add</button><button class="btn" id="ws-remove-domain" type="button">Remove</button></div>
             <div class="domchips" id="ws-domchips" aria-label="Current scope"></div>
+          </div>
+          <div class="field wide" style="margin-top:16px">
+            <label for="ws-ranges">IP ranges <span class="count" id="ws-rangecount"></span></label>
+            <div class="inline"><input id="ws-ranges" autocomplete="off" spellcheck="false" placeholder="e.g. 1.2.3.0/24 1.2.4.9">
+              <button class="btn" id="ws-add-range" type="button">Add</button><button class="btn" id="ws-remove-range" type="button">Remove</button></div>
+            <small>Public IPv4 CIDR blocks, up to 2,048 addresses (one /21) by default (CTI_MAX_RANGE_IPS raises it, up to 65,536). Larger scopes make scans slower. Scanned with the domains on the next scan; addresses a domain already points to are scanned under that hostname. List only ranges you own or are cleared to test.</small>
+            <div class="domchips" id="ws-rangechips" aria-label="Current IP ranges"></div>
           </div>
         </div>
         <div class="grid two">
@@ -1060,6 +1076,7 @@ let graphMeta = null;
 let currentOrg = 'sample';
 let orgNames = {};
 let orgDomains = {};
+let orgRanges = {};
 let sortBy = 'severity';
 let statusFilter = 'all';
 let tierFilter = 'all';
@@ -1559,11 +1576,18 @@ function init() {
   $('neworg-btn').addEventListener('click', showNewOrg);
   $('no-cancel').addEventListener('click', hideNewOrg);
   $('no-create').addEventListener('click', createNewOrg);
-  ['no-slug', 'no-name', 'no-domains'].forEach((id) => {
+  ['no-slug', 'no-name', 'no-domains', 'no-ranges'].forEach((id) => {
     $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); createNewOrg(); } });
   });
   $('no-slug').addEventListener('input', () => { $('no-slug').value = normalizeSlug($('no-slug').value); });
   $('ws-add-domain').addEventListener('click', () => sendDomainAction('add'));
+  $('ws-add-range').addEventListener('click', () => sendRangeAction('add'));
+  $('ws-remove-range').addEventListener('click', () => sendRangeAction('remove'));
+  $('ws-ranges').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); sendRangeAction('add'); } });
+  $('ws-rangechips').addEventListener('click', (e) => {
+    const x = e.target.closest('.dx');
+    if (x && x.dataset.range) sendRangeAction('remove', [x.dataset.range]);
+  });
   $('ws-remove-domain').addEventListener('click', () => sendDomainAction('remove'));
   $('ws-domchips').addEventListener('click', (e) => {
     const x = e.target.closest('.dx');
@@ -1896,6 +1920,7 @@ function showNewOrg() {
   $('no-slug').value = '';
   $('no-name').value = '';
   $('no-domains').value = '';
+  $('no-ranges').value = '';
   $('no-slug').focus();
   setWsMsg('New organization — fill slug + domains, then Create org');
 }
@@ -1910,12 +1935,13 @@ function createNewOrg() {
   if (!slug) return setWsMsg('new org: slug is required (lowercase letters, digits, hyphens)', true);
   if (!SLUG_RE.test(slug)) return setWsMsg('new org: invalid slug — lowercase a-z, 0-9, hyphens, max 32', true);
   const domains = $('no-domains').value.split(/[\s,]+/).map((d) => d.trim()).filter(Boolean);
-  if (!domains.length) return setWsMsg('new org: enter at least one domain', true);
+  const ip_ranges = $('no-ranges').value.split(/[\s,]+/).map((r) => r.trim()).filter(Boolean);
+  if (!domains.length && !ip_ranges.length) return setWsMsg('new org: enter at least one domain or IP range', true);
   setWsMsg('Creating organization ' + slug + '…');
   fetch('/api/orgs/register', {
     method: 'POST',
     headers: authHeaders(),
-    body: JSON.stringify({ slug, name: $('no-name').value.trim(), domains })
+    body: JSON.stringify({ slug, name: $('no-name').value.trim(), domains, ip_ranges })
   }).then((r) => r.json().then((body) => ({ ok: r.ok, body }))).then(({ ok, body }) => {
     if (!ok) return setWsMsg('Create failed: ' + (body.error || 'error'), true);
     setWsMsg('Organization created: ' + (body.slug || slug) + ' — selected. Run Scan when ready.');
@@ -2572,9 +2598,11 @@ function loadOrgs(preferSlug, done) {
     const sel = $('orgsel');
     orgNames = {};
     orgDomains = {};
+    orgRanges = {};
     sel.innerHTML = list.map((o) => {
       orgNames[o.slug] = o.name || o.slug;
       orgDomains[o.slug] = (o.domains || []).slice();
+      orgRanges[o.slug] = (o.ip_ranges || []).slice();
       return '<option value="' + esc(o.slug) + '">' + esc(o.name || o.slug) + '</option>';
     }).join('');
     let prefer = null;
@@ -2612,8 +2640,10 @@ function loadOrgs(preferSlug, done) {
 function updateOrgName() {
   refreshOrgNameField();
   const ds = orgDomains[currentOrg] || [];
-  $('orgname').textContent = ds.length ? ds.slice(0, 3).join(' · ') + (ds.length > 3 ? ` +${ds.length - 3}` : '') : 'No domains yet';
-  $('orgname').title = ds.join(', ');
+  const rs = orgRanges[currentOrg] || [];
+  const scope = ds.concat(rs);
+  $('orgname').textContent = scope.length ? scope.slice(0, 3).join(' · ') + (scope.length > 3 ? ` +${scope.length - 3}` : '') : 'No domains yet';
+  $('orgname').title = scope.join(', ');
 }
 
 function refreshDomainsField() {
@@ -2625,6 +2655,36 @@ function refreshDomainsField() {
     '<span class="domchip"><span class="dtext">' + esc(d) + '</span>' +
     '<button class="dx" data-domain="' + esc(d) + '" type="button" aria-label="Remove ' + esc(d) + '" title="Remove ' + esc(d) + '">×</button></span>'
   ).join('') || '<span class="empty" style="font-size:11px;">No domains yet</span>';
+  refreshRangesField();
+}
+
+function refreshRangesField() {
+  const rs = orgRanges[currentOrg] || [];
+  $('ws-ranges').value = '';
+  $('ws-rangecount').textContent = rs.length ? rs.length + ' range' + (rs.length === 1 ? '' : 's') : '';
+  $('ws-rangechips').innerHTML = rs.map((r) =>
+    '<span class="domchip"><span class="dtext mono">' + esc(r) + '</span>' +
+    '<button class="dx" data-range="' + esc(r) + '" type="button" aria-label="Remove ' + esc(r) + '" title="Remove ' + esc(r) + '">×</button></span>'
+  ).join('') || '<span class="empty" style="font-size:11px;">No IP ranges</span>';
+}
+
+function sendRangeAction(action, list) {
+  const ranges = list || $('ws-ranges').value.trim().split(/[\s,]+/).map((r) => r.trim()).filter(Boolean);
+  if (!ranges.length) return setWsMsg('Enter one or more IP ranges first', true);
+  if (!currentOrg) return setWsMsg('Select a workspace first', true);
+  const add = action === 'add';
+  setWsMsg((add ? 'Adding ' : 'Removing ') + ranges.join(' ') + '…');
+  fetch('/api/orgs/' + encodeURIComponent(currentOrg) + '/ip_ranges', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ ranges, action })
+  }).then((r) => r.json().then((body) => ({ ok: r.ok, body }))).then(({ ok, body }) => {
+    if (!ok) return setWsMsg((add ? 'Add' : 'Remove') + ' failed: ' + (body.error || 'error'), true);
+    orgRanges[currentOrg] = (body.ip_ranges || []).slice();
+    refreshRangesField();
+    updateOrgName();
+    setWsMsg((add ? 'Added' : 'Removed') + '. ' + (body.addresses || 0) + ' address(es) in range scope; they are scanned on the next full scan.');
+  }).catch(() => setWsMsg('Network error', true));
 }
 
 let _refreshSeq = 0;   // guards against out-of-order responses (stale org data)
@@ -3655,7 +3715,7 @@ function renderHosts(d) {
   const sel = $('host-domain');
   const keep = sel.value;
   const doms = [...new Set(rows.map((h) => h.domain))].sort();
-  sel.innerHTML = '<option value="">All domains</option>' + doms.map((x) => `<option value="${esc(x)}">${esc(x)}</option>`).join('');
+  sel.innerHTML = '<option value="">All domains &amp; ranges</option>' + doms.map((x) => `<option value="${esc(x)}">${esc(x)}</option>`).join('');
   if (doms.includes(keep)) sel.value = keep;
   renderHostRows();
   const rated = rows.filter((h) => !h.unknown || h.critical_exposure);
@@ -3693,7 +3753,7 @@ function renderHostRows() {
     if (h.coverage_cap) notes.push('grade limited by coverage');
     return `<tr class="clickable" data-host="${esc(h.host)}" tabindex="0" aria-expanded="${open}">
       <td>${h.unknown ? gradeChip('?') + ` <span class="dim">${h.critical_exposure ? 'Critical, too little evidence to score' : 'Not enough evidence'}</span>` : gradeChip(h.grade) + ` <b style="margin-left:6px">${esc(h.score)}</b>`}</td>
-      <td><span class="rowtitle mono">${esc(h.host)}</span><span class="rowsub">${esc(h.domain)}${notes.length ? ' · ' + esc(notes.join(' · ')) : ''}</span></td>
+      <td><span class="rowtitle mono">${esc(h.host)}</span><span class="rowsub">${h.kind === 'range' ? 'IP range ' : ''}${esc(h.domain)}${notes.length ? ' · ' + esc(notes.join(' · ')) : ''}</span></td>
       <td>${hostIssuePills(h, 3)}</td>
       <td class="num">${esc(h.coverage)}%</td>
       <td class="num">${esc(h.open_findings || 0)}</td>
@@ -3924,11 +3984,17 @@ function findingCard(f) {
   const srcHtml = sourceLinksHtml(f);
   const target = f.target && f.target !== 'None' ? f.target : '';
   const ip = f.ip && f.ip !== 'None' ? f.ip : '';
+  const port = f.port != null && f.port !== '' ? String(f.port) : '';
+  // always-visible "where and what": host:port, ip, category, date
+  const sub = [];
+  if (target) sub.push('<span class="host">' + esc(target) + (port ? ':' + esc(port) : '') + '</span>');
+  else if (port) sub.push('<span class="mono">port ' + esc(port) + '</span>');
+  if (ip) sub.push('<span class="mono ip">' + esc(ip) + '</span>');
+  if (f.category) sub.push('<span>' + esc(f.category) + '</span>');
+  if (f.found_date) sub.push('<span>found ' + esc(f.found_date) + '</span>');
   const meta = [];
-  if (target) meta.push('<div class="mrow"><span class="mlabel">host</span><span class="mval host">' + esc(target) + '</span></div>');
-  if (ip) meta.push('<div class="mrow"><span class="mlabel">ip</span><span class="mval ip">' + esc(ip) + '</span></div>');
-  if (f.found_date) meta.push('<div class="mrow"><span class="mlabel">found</span><span class="mval">' + esc(f.found_date) + '</span></div>');
   if (f.first_seen) meta.push('<div class="mrow"><span class="mlabel">first</span><span class="mval">' + esc(f.first_seen) + '</span></div>');
+  if (f.last_seen) meta.push('<div class="mrow"><span class="mlabel">last</span><span class="mval">' + esc(f.last_seen) + '</span></div>');
   if (srcHtml) meta.push('<div class="mrow"><span class="mlabel">src</span><span class="mval">' + srcHtml + '</span></div>');
   return '<div class="fcard collapsed" data-id="' + esc(f.id) + '">' +
     '<div class="fhead" role="button" tabindex="0" aria-expanded="false">' +
@@ -3943,8 +4009,9 @@ function findingCard(f) {
       positivePill(f) +
       '<span class="fview" role="button" tabindex="0">Details</span>' +
     '</div>' +
+    (sub.length ? '<div class="fsub">' + sub.join('') + '</div>' : '') +
+    (f.summary ? '<p class="fsum">' + esc(f.summary) + '</p>' : '') +
     '<div class="fbody">' +
-      (f.category ? '<div class="fcat">' + esc(f.category) + '</div>' : '') +
       cveHtml +
       (meta.length ? '<div class="fmeta">' + meta.join('') + '</div>' : '') +
       (target ? '<div style="margin-top:6px"><button class="btn ghost" data-vuln-target="' + esc(target) + '" type="button" title="Vuln lookup for this host (CVE + config audit, passive)">vuln: this host</button></div>' : '') +

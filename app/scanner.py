@@ -47,6 +47,10 @@ def _env_int(name, default):
         return default
 
 MAX_TOTAL_HOSTS = _env_int("CTI_MAX_HOSTS", 200)      # resolved hosts per scan
+MAX_RANGES = 16                                        # CIDR entries per org
+RANGE_IPS_CEILING = 65536                              # hard limit: one /16 per org
+# addresses per org across all its ranges; the default fits one /21
+MAX_RANGE_IPS = min(max(_env_int("CTI_MAX_RANGE_IPS", 2048), 1), RANGE_IPS_CEILING)
 ENUM_NAME_CAP = _env_int("CTI_ENUM_CAP", 500)         # names per enum source
 CURL_MAX_BYTES = _env_int("CTI_CURL_MAX_BYTES", 204800)
 FINGERPRINT_BODY_BYTES = _env_int("CTI_FP_BODY_BYTES", 65536)
@@ -127,6 +131,82 @@ def _is_valid_domain(d: str) -> bool:
     if any(part.endswith("-") or part.startswith("-") for part in d.split(".")):
         return False
     return True
+
+
+def _range_hosts(net):
+    """Scannable addresses of a block: network/broadcast skipped below /31."""
+    return [str(ip) for ip in (net.hosts() if net.prefixlen < 31 else net)]
+
+
+def parse_ip_range(value):
+    """Canonical IPv4 CIDR for one operator entry, or (None, reason).
+
+    A bare address becomes a /32 and host bits are cleared
+    (203.0.113.9/24 -> 203.0.113.0/24). A block larger than the org's address
+    limit (MAX_RANGE_IPS) is refused so a typo cannot queue a /8, and every
+    address must be globally routable: ranges are for infrastructure you own
+    on the public internet.
+    """
+    s = str(value or "").strip()
+    if not s:
+        return None, "empty range"
+    try:
+        net = ipaddress.ip_network(s if "/" in s else s + "/32", strict=False)
+    except ValueError:
+        return None, f"{s}: not an IPv4 address or CIDR block"
+    if net.version != 4:
+        return None, f"{s}: only IPv4 ranges are supported"
+    if net.num_addresses > MAX_RANGE_IPS:
+        return None, (f"{s}: {net.num_addresses} addresses, more than the limit of "
+                      f"{MAX_RANGE_IPS} (CTI_MAX_RANGE_IPS)")
+    if not all(ip.is_global for ip in net):
+        return None, f"{s}: includes private, reserved or non-routable addresses"
+    return str(net), None
+
+
+def normalize_ip_ranges(values):
+    """(canonical ranges, error) for a whole scope list; enforces the caps."""
+    out = []
+    for v in values or []:
+        cidr, err = parse_ip_range(v)
+        if err:
+            return None, err
+        if cidr not in out:
+            out.append(cidr)
+    if len(out) > MAX_RANGES:
+        return None, f"too many ranges (max {MAX_RANGES})"
+    total = len(set(expand_ip_ranges(out, cap=None)))
+    if total > MAX_RANGE_IPS:
+        return None, (f"ranges cover {total} addresses, more than the limit of "
+                      f"{MAX_RANGE_IPS} per organization (CTI_MAX_RANGE_IPS)")
+    return out, None
+
+
+def expand_ip_ranges(ranges, cap=-1):
+    """Unique scannable IPs from stored ranges, in order; invalid entries skipped.
+
+    `cap` -1 applies MAX_RANGE_IPS, None returns every address.
+    """
+    if cap == -1:
+        cap = MAX_RANGE_IPS
+    ips, seen = [], set()
+    for r in ranges or []:
+        cidr, err = parse_ip_range(r)
+        if err:
+            continue
+        for ip in _range_hosts(ipaddress.ip_network(cidr)):
+            if ip not in seen:
+                seen.add(ip)
+                ips.append(ip)
+    return ips if cap is None else ips[:cap]
+
+
+def _is_ip_literal(host) -> bool:
+    try:
+        ipaddress.ip_address(str(host).strip())
+        return True
+    except ValueError:
+        return False
 
 
 def _is_global_ip(ip_str: str) -> bool:
@@ -673,8 +753,13 @@ def _tls_cert(host, ip=None, port=443, timeout=6):
         # self-signed certs, missing intermediates and expired roots that the
         # CERT_NONE capture above would otherwise accept silently.
         chain_trusted, chain_error = False, ""
+        bare_ip = _is_ip_literal(host)
         try:
             vctx = ssl.create_default_context()
+            if bare_ip:
+                # a range address has no name clients use, so only the chain
+                # is judged; a name check would fail every cert served there
+                vctx.check_hostname = False
             with socket.create_connection((connect_to, port), timeout=timeout) as vsock:
                 with vctx.wrap_socket(vsock, server_hostname=host):
                     chain_trusted = True
@@ -725,7 +810,9 @@ def _tls_cert(host, ip=None, port=443, timeout=6):
             "sans": [str(s[1])[:120] for s in sans[:CERT_SAN_CAP]
                      if isinstance(s, (list, tuple)) and len(s) > 1],
             "self_signed": self_signed,
-            "hostname_ok": _hostname_matches_cert(host, sans, subject_cn),
+            # None = not applicable (bare IP without an IP SAN), never a mismatch
+            "hostname_ok": (_hostname_matches_cert(host, sans, subject_cn)
+                            or (None if bare_ip else False)),
             "chain_trusted": chain_trusted,
             "chain_error": chain_error,
         }
@@ -744,7 +831,7 @@ def _tls_cert(host, ip=None, port=443, timeout=6):
 def _resolve_args(host, ips):
     """curl --resolve pinning args for the first validated IP (anti-rebinding)."""
     args = []
-    if ips:
+    if ips and not _is_ip_literal(host):
         for ip in ips[:1]:
             args.extend(["--resolve", f"{host}:443:{ip}", "--resolve", f"{host}:80:{ip}"])
     return args
@@ -3767,8 +3854,8 @@ def generate_org(org, mode="fast", ai_profile=None, on_progress=None):
     raw_domains = [str(d).strip().lower().rstrip(".")
                    for d in (org.get("domains") or []) if str(d).strip()]
     domains = [d for d in raw_domains if _is_valid_domain(d)]
-    if not domains:
-        raise ValueError("no valid domains for org %r" % slug)
+    if not domains and not expand_ip_ranges(org.get("ip_ranges")):
+        raise ValueError("no valid domains or IP ranges for org %r" % slug)
 
     org_dir = os.path.join(ORG_ROOT, slug)
     os.makedirs(org_dir, exist_ok=True)
@@ -3828,7 +3915,23 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
                          f"phantom host(s) for {slug}")
             _emit(on_progress, "resolve",
                   f"wildcard filter dropped {wildcard_dropped} phantom hosts")
+
+    # --- registered IP ranges: every address is its own host entry, unless a
+    # discovered hostname already leads there (its probes cover that IP) ---
+    covered = {ips[0] for ips in hosts.values() if ips}
+    range_hosts = [ip for ip in expand_ip_ranges(org.get("ip_ranges"))
+                   if ip not in covered and ip not in hosts]
+    for ip in range_hosts:
+        hosts[ip] = [ip]
+    if range_hosts:
+        _emit(on_progress, "resolve", f"added {len(range_hosts)} address(es) from IP ranges")
+    range_set = set(range_hosts)
     _stage_done("resolve")
+
+    def _candidates():
+        # hostnames keep their own cap; range IPs are capped by MAX_RANGE_IPS
+        named = [h for h in sorted(hosts) if hosts[h] and h not in range_set]
+        return named[:MAX_TOTAL_HOSTS] + range_hosts
 
     # --- baseline.txt: hosts + their resolved IPs (dedup, order preserved) ---
     baseline = []
@@ -3846,7 +3949,7 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
     reached = []
     snippets = {}
     certs = {}
-    probe_candidates = [h for h in sorted(hosts) if hosts[h]][:MAX_TOTAL_HOSTS]
+    probe_candidates = _candidates()
     _emit(on_progress, "probe", f"probing+fingerprinting {len(probe_candidates)} hosts")
     if probe_candidates:
         with _cf.ThreadPoolExecutor(max_workers=HTTP_WORKERS) as ex:
@@ -3871,7 +3974,7 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
 
     # --- service probe: for each resolved host/IP, TCP-connect common ports ---
     services = {}
-    service_candidates = [h for h in sorted(hosts) if hosts[h]][:MAX_TOTAL_HOSTS]
+    service_candidates = _candidates()
     _emit(on_progress, "probe", f"probing service ports on {len(service_candidates)} hosts")
     reachable_pairs = []
     if service_candidates:
@@ -3971,7 +4074,7 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
         _emit(on_progress, "capture", "DNS posture (SPF/DMARC/DKIM/DNSSEC/CAA)")
         try:
             import dns_posture
-            known_hosts = list(hosts.keys())[:DNS_TAKEOVER_HOST_CAP]
+            known_hosts = [h for h in hosts if h not in range_set][:DNS_TAKEOVER_HOST_CAP]
             for dom in domains[:DNS_MAX_DOMAINS]:
                 try:
                     dns_results.append(dns_posture.assess(dom, hosts=known_hosts))
@@ -4097,7 +4200,11 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
                 "date": time.strftime("%Y-%m-%d"),
                 "scope": "external, passive (CT + DNS + HTTP + TCP service probe), non-destructive",
                 "domains": domains,
-                "subdomains": len(hosts),
+                "subdomains": len(hosts) - len(range_hosts),
+                # registered IPv4 ranges and the addresses scanned from them
+                # (addresses a hostname already reached are scanned under it)
+                "ip_ranges": list(org.get("ip_ranges") or []),
+                "range_hosts": range_hosts,
                 "reachable": len(reached),
                 # per-host evidence snippets (status/server/title), PII-safe
                 "fingerprints": {h: s for h, s in snippets.items()},

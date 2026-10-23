@@ -84,7 +84,8 @@ def test_model_override_reaches_the_provider(no_config, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "k")
     seen = {}
 
-    def fake(base_url, model, prompt, timeout, key_env, max_tokens=1024, cap_retry=True):
+    def fake(base_url, model, prompt, timeout, key_env, max_tokens=1024, cap_retry=True,
+             session=None):
         seen.update(model=model, base_url=base_url)
         return '{"ok": true}', None, {}
     monkeypatch.setattr(ap, "_call_openai_compatible", fake)
@@ -274,8 +275,8 @@ def deepseek(no_config, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     replies = []
 
-    def fake_call(prompt, profile_name=None, model=None):
-        replies.append((profile_name, model))
+    def fake_call(prompt, profile_name=None, model=None, session=None):
+        replies.append((profile_name, model, session))
         return '{"answer": "Close RDP.", "cites": ["port-3389"]}', {
             "provider": "openai-compatible", "model": model or "deepseek-v4-pro", "profile": profile_name}
     monkeypatch.setattr(ap, "call_ai", fake_call)
@@ -301,7 +302,9 @@ def test_assistant_endpoint(workspace, deepseek):
     assert r.status_code == 200
     body = r.json()
     assert body["answer"] == "Close RDP." and body["cites"][0]["verified"] is True
-    assert deepseek[-1] == ("deepseek", "deepseek-flash")
+    profile, model, session = deepseek[-1]
+    assert (profile, model) == ("deepseek", "deepseek-flash")
+    assert session  # assistant steps carry a conversation id (OpenCode routing)
 
 
 def test_assistant_is_concurrency_capped(workspace, deepseek):
