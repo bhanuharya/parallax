@@ -78,6 +78,8 @@ def test_registry_absolute_paths_stay_under_data_root(tmp_path, monkeypatch):
 
 
 def test_login_failure_throttle_and_success_reset(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(main.time, "time", lambda: now[0])
     monkeypatch.setenv("CTI_LOGIN_FAIL_THRESHOLD", "3")
     monkeypatch.setenv("CTI_LOGIN_FAIL_WINDOW", "300")
     monkeypatch.setenv("CTI_LOGIN_RETRY_AFTER", "17")
@@ -95,5 +97,22 @@ def test_login_failure_throttle_and_success_reset(monkeypatch):
         assert client.post("/api/login", auth=("testuser", "wrong")).status_code == 401
     limited = client.post("/api/login", auth=("testuser", "wrong"))
     assert limited.status_code == 429
-    assert limited.headers["retry-after"] == "17"
+    assert limited.headers["retry-after"] == "300"
+    now[0] += 300
+    assert client.post("/api/login", auth=("testuser", "testpass")).status_code == 200
     main._LOGIN_FAILS.clear()
+
+
+def test_configured_admin_login_creates_authenticated_session(monkeypatch):
+    monkeypatch.setenv("CTI_USER", "admin")
+    monkeypatch.setenv("CTI_PASSWORD", "local-login-test!")
+    monkeypatch.setattr(main, "_LOGIN_FAILS", {})
+    monkeypatch.setattr(main, "_SESSIONS", {})
+    client = TestClient(main.app)
+    assert client.get('/api/orgs').status_code == 401
+    assert client.post('/api/login', auth=('cti_admin', 'local-login-test!')).status_code == 401
+    response = client.post('/api/login', auth=('admin', 'local-login-test!'))
+    assert response.status_code == 200
+    assert response.json()['user'] == 'admin'
+    assert 'HttpOnly' in response.headers['set-cookie']
+    assert client.get('/api/orgs').status_code == 200

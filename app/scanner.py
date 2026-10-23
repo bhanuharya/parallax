@@ -26,6 +26,9 @@ from collections import Counter, defaultdict
 import cti_correlation as cc
 import ai_providers
 import cve_match
+import dependencies
+import live_cve
+import tech_detect
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 BASE = os.path.dirname(BASE)
@@ -60,6 +63,21 @@ AI_PHASE_BUDGET = _env_int("CTI_AI_BUDGET", 240)      # seconds for whole AI pha
 RECHECK_STREAK_MITIGATE = 2
 NVD_MAX_LOOKUPS = _env_int("CTI_NVD_MAX_LOOKUPS", 20)  # NVD API calls per scan
 MAX_DIFF_FINDINGS = _env_int("CTI_MAX_DIFF_FINDINGS", 50)  # new-exposure findings/scan
+
+# --- certificate inventory tunables ---
+CERT_EXPIRY_WARN_DAYS = _env_int("CTI_CERT_EXPIRY_WARN_DAYS", 30)  # expiring-soon window
+CERT_SAN_CAP = _env_int("CTI_CERT_SAN_CAP", 50)                   # SANs kept per cert
+MAX_CERT_FINDINGS = _env_int("CTI_MAX_CERT_FINDINGS", 100)        # cert findings/scan
+
+# --- DNS / email-authentication posture tunables ---
+DNS_POSTURE_ENABLED = os.environ.get("CTI_DNS_POSTURE", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+DNS_MAX_DOMAINS = _env_int("CTI_DNS_MAX_DOMAINS", 10)      # domains assessed per scan
+DNS_TAKEOVER_HOST_CAP = _env_int("CTI_DNS_TAKEOVER_HOSTS", 25)  # CNAME probes per scan
+
+# --- framework detection ---
+TECH_DETECT_CAP = _env_int("CTI_TECH_DETECT_CAP", 16)      # detections kept per host
+ASSET_CAP = _env_int("CTI_ASSET_CAP", 30)                  # script/style assets kept per host
 
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(\.(?!-)[A-Za-z0-9-]{1,63})+$")
 
@@ -517,7 +535,7 @@ _TECH_SIGNATURES = (
     ("citrix / netscaler", re.compile(r"citrix|netscaler|LogonPoint|Receiver for", re.I)),
     ("palo alto globalprotect", re.compile(r"globalprotect", re.I)),
     ("cisco asa / anyconnect", re.compile(r"\+CSCOE\+|anyconnect|webvpn", re.I)),
-    ("f5 big-ip", re.compile(r"F5|BIG-IP|bigipwebdav|/my.policy", re.I)),
+    ("f5 big-ip", re.compile(r"bigipwebdav|(?:action|href)=[\"']/my\.policy(?:[?\"'])", re.I)),
     ("pulse secure / ivanti", re.compile(r"pulse secure|pulsesecure|ivanti|dana-na", re.I)),
     ("sonicwall", re.compile(r"sonicwall|sslvpn", re.I)),
     ("zimbra", re.compile(r"zimbra", re.I)),
@@ -525,7 +543,7 @@ _TECH_SIGNATURES = (
     ("confluence", re.compile(r"confluence", re.I)),
     ("tomcat", re.compile(r"apache tomcat", re.I)),
     ("phpmyadmin", re.compile(r"phpmyadmin|pma_absolute_uri", re.I)),
-    ("vmware horizon", re.compile(r"horizon|view client|blast", re.I)),
+    ("vmware horizon", re.compile(r"(?:src|href)=[\"'][^\"']*/portal/webclient/|VMware\s+Horizon\s+(?:Client|HTML\s+Access)", re.I)),
     ("microsoft iis", re.compile(r"asp\.net|\.aspx|x-powered-by: asp\.net", re.I)),
 )
 _META_GENERATOR_RE = re.compile(r"<meta[^>]+name=[\"']generator[\"'][^>]+content=[\"']([^\"']+)[\"']", re.I)
@@ -566,30 +584,106 @@ def parse_versions(text):
     return out
 
 
+def _cert_rdn(info, section, field):
+    """First value of `field` (e.g. commonName) inside a decoded cert section."""
+    for rdn in (info.get(section) or ()):
+        for k, v in rdn:
+            if k == field:
+                return str(v)[:120]
+    return ""
+
+
+def _hostname_matches_cert(host, san_entries, subject_cn):
+    """True if `host` is covered by the cert's SANs (or a CN fallback).
+
+    RFC 6125 matching: exact FQDN, or a single leading wildcard label
+    (`*.example.com` covers `a.example.com`, not `a.b.example.com`).
+    IP-literal hosts must match an IP SAN exactly.
+    """
+    h = str(host or "").strip().lower().rstrip(".")
+    if not h:
+        return False
+    try:
+        ipaddress.ip_address(h)
+        wants_ip = True
+    except ValueError:
+        wants_ip = False
+
+    for entry in san_entries or ():
+        try:
+            kind, value = str(entry[0]).strip().lower(), str(entry[1]).strip().lower().rstrip(".")
+        except (IndexError, TypeError):
+            continue
+        # stdlib emits "IP Address" / "DNS"; compare case-insensitively
+        if kind == "ip address":
+            if wants_ip and value == h:
+                return True
+            continue
+        if kind != "dns" or wants_ip:
+            continue
+        if value == h:
+            return True
+        if value.startswith("*."):
+            suffix = value[1:]  # ".example.com"
+            if h.endswith(suffix) and h.count(".") == suffix.count("."):
+                return True
+    # CN fallback applies only when the cert has no SAN extension at all
+    if not san_entries and subject_cn and not wants_ip:
+        cn = subject_cn.strip().lower().rstrip(".")
+        if cn == h:
+            return True
+        if cn.startswith("*.") and h.endswith(cn[1:]) and h.count(".") == cn.count("."):
+            return True
+    return False
+
+
 def _tls_cert(host, ip=None, port=443, timeout=6):
     """Inspect the TLS certificate via a stdlib handshake (non-intrusive).
 
-    Returns a compact dict {not_after, days_left, expired, self_signed,
-    issuer_cn, san_count} or None. This is the data behind the new
-    expired/expiring/self-signed deterministic findings.
+    Returns a compact dict describing the served certificate:
+        not_after, not_before, days_left, expired, expiring_soon, self_signed,
+        issuer_cn, issuer_org, subject_cn, san_count, sans, hostname_ok,
+        chain_trusted, chain_error, key_bits
+    or None when no certificate could be retrieved.
+
+    The capture handshake deliberately ignores validation errors so an expired
+    or untrusted certificate is still recorded — that is the point of the
+    check. Chain validity is then tested separately against the system trust
+    store, so a self-signed or incomplete chain is distinguishable from a
+    healthy cert issued by a public CA.
     """
     try:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE  # we want the cert even when invalid
+        ctx.verify_mode = ssl.CERT_NONE  # capture the cert even when invalid
         connect_to = ip or host
+        der = None
+        key_bits = None
         with socket.create_connection((connect_to, port), timeout=timeout) as sock:
-            if ip and ip != host:
-                # SNI must carry the real hostname while connecting by IP
-                with ctx.wrap_socket(sock, server_hostname=host) as tls:
-                    der = tls.getpeercert(binary_form=True)
-            else:
-                with ctx.wrap_socket(sock, server_hostname=host) as tls:
-                    der = tls.getpeercert(binary_form=True)
+            # SNI must carry the real hostname while connecting by IP
+            with ctx.wrap_socket(sock, server_hostname=host) as tls:
+                der = tls.getpeercert(binary_form=True)
+                ci = tls.cipher()
+                if ci:
+                    key_bits = ci[2]
         if not der:
             return None
-        # parse without cryptography lib: load into an ssl-friendly DER->PEM and
-        # use _ssl._test_decode_cert (stdlib, used by CPython's own tests)
+
+        # Independent chain check against the system trust store. This catches
+        # self-signed certs, missing intermediates and expired roots that the
+        # CERT_NONE capture above would otherwise accept silently.
+        chain_trusted, chain_error = False, ""
+        try:
+            vctx = ssl.create_default_context()
+            with socket.create_connection((connect_to, port), timeout=timeout) as vsock:
+                with vctx.wrap_socket(vsock, server_hostname=host):
+                    chain_trusted = True
+        except ssl.SSLCertVerificationError as e:
+            chain_error = str(getattr(e, "verify_message", "") or e)[:160]
+        except Exception as e:
+            chain_error = type(e).__name__
+
+        # parse without the cryptography lib: DER -> PEM -> stdlib decoder
         import tempfile as _tmp
         import datetime
         pem = ssl.DER_cert_to_PEM_cert(der)
@@ -606,6 +700,7 @@ def _tls_cert(host, ip=None, port=443, timeout=6):
             except OSError:
                 pass
         not_after = str(info.get("notAfter", "")).strip()
+        not_before = str(info.get("notBefore", "")).strip()
         days_left = None
         expired = None
         try:
@@ -615,25 +710,31 @@ def _tls_cert(host, ip=None, port=443, timeout=6):
             expired = days_left < 0
         except Exception:
             pass
-        issuer_parts = info.get("issuer") or ()
-        issuer_cn = ""
-        for rdn in issuer_parts:
-            for k, v in rdn:
-                if k == "commonName":
-                    issuer_cn = str(v)[:80]
-        subject_parts = info.get("subject") or ()
-        subject_cn = ""
-        for rdn in subject_parts:
-            for k, v in rdn:
-                if k == "commonName":
-                    subject_cn = str(v)[:80]
-        san_count = len((info.get("subjectAltName") or []))
+        issuer_cn = _cert_rdn(info, "issuer", "commonName")
+        issuer_org = _cert_rdn(info, "issuer", "organizationName")
+        subject_cn = _cert_rdn(info, "subject", "commonName")
+        sans = info.get("subjectAltName") or ()
         self_signed = bool(issuer_cn) and bool(subject_cn) and issuer_cn == subject_cn
-        out = {"not_after": not_after[:40], "issuer_cn": issuer_cn,
-               "self_signed": self_signed, "san_count": san_count}
+        out = {
+            "not_after": not_after[:40],
+            "not_before": not_before[:40],
+            "issuer_cn": issuer_cn,
+            "issuer_org": issuer_org,
+            "subject_cn": subject_cn,
+            "san_count": len(sans),
+            "sans": [str(s[1])[:120] for s in sans[:CERT_SAN_CAP]
+                     if isinstance(s, (list, tuple)) and len(s) > 1],
+            "self_signed": self_signed,
+            "hostname_ok": _hostname_matches_cert(host, sans, subject_cn),
+            "chain_trusted": chain_trusted,
+            "chain_error": chain_error,
+        }
         if days_left is not None:
             out["days_left"] = days_left
             out["expired"] = bool(expired)
+            out["expiring_soon"] = bool(0 <= days_left <= CERT_EXPIRY_WARN_DAYS)
+        if key_bits:
+            out["key_bits"] = int(key_bits)
         return out
     except Exception as e:
         _log("debug", f"TLS inspect failed for {host}:{port}: {type(e).__name__}")
@@ -647,6 +748,30 @@ def _resolve_args(host, ips):
         for ip in ips[:1]:
             args.extend(["--resolve", f"{host}:443:{ip}", "--resolve", f"{host}:80:{ip}"])
     return args
+
+
+def _split_headers_body(raw):
+    """Split a `curl -D - -o -` response into (header_block, body).
+
+    curl emits the two protocols differently: an HTTP/1.1 response separates
+    the header block from the body with CRLF CRLF, while an **HTTP/2** response
+    uses a bare LF LF. Splitting only on CRLF CRLF therefore yields an EMPTY
+    body for every HTTP/2 site — which is most of the modern web — silently
+    disabling all body-based analysis (title, <meta generator>, tech
+    signatures, login-form detection, version parsing). Verified against
+    wordpress.org / example.com / github.com, all of which return HTTP/2.
+
+    Returns ("", "") when the input is empty. The body is returned unmodified
+    (only the separator is consumed) so non-UTF8 content is not corrupted.
+    """
+    raw = raw or ""
+    crlf = raw.find("\r\n\r\n")
+    lf = raw.find("\n\n")
+    if crlf != -1 and (lf == -1 or crlf <= lf):
+        return raw[:crlf], raw[crlf + 4:]
+    if lf != -1:
+        return raw[:lf], raw[lf + 2:]
+    return raw, ""
 
 
 def _fetch_fingerprint(host, timeout=8, ips=None):
@@ -671,7 +796,11 @@ def _fetch_fingerprint(host, timeout=8, ips=None):
     resolve_args = _resolve_args(host, ips)
     for scheme in ("https", "http"):
         try:
-            cmd = ["curl", "-s", "-m", str(timeout),
+            # --insecure: this request only OBSERVES the page. Certificate
+            # validity is judged separately by _tls_cert; refusing an expired
+            # or mismatched certificate here would drop the host to plain
+            # HTTP and misreport it as "served without HTTPS".
+            cmd = ["curl", "-s", "--insecure", "-m", str(timeout),
                    "--max-filesize", str(CURL_MAX_BYTES),
                    "--noproxy", "*", "--max-redirs", "0",
                    "-D", "-", "-o", "-"] + resolve_args + [f"{scheme}://{host}/"]
@@ -680,7 +809,7 @@ def _fetch_fingerprint(host, timeout=8, ips=None):
             raw = (r.stdout or "")
             if len(raw) > CURL_MAX_BYTES:
                 raw = raw[:CURL_MAX_BYTES]
-            headers_blob, _, body = raw.partition("\r\n\r\n")
+            headers_blob, body = _split_headers_body(raw)
             if not headers_blob and not body:
                 continue
             m = re.search(r"^HTTP/[0-9.]+ (\d{3})", headers_blob, re.M)
@@ -735,6 +864,38 @@ def _fetch_fingerprint(host, timeout=8, ips=None):
                 for pv in parse_versions(src):
                     if pv not in versions:
                         versions.append(pv)
+            # --- framework/CMS detection ---
+            # The header/title parser above finds web servers; the application
+            # stack (WordPress, Django, Rails, jQuery, ...) is what most
+            # exploitable CVEs actually live in. Versioned detections are
+            # folded into `versions` so the existing CVE matcher covers them;
+            # the full detection list is kept for the inventory UI.
+            try:
+                detections = tech_detect.detect(
+                    html=body_head, headers=snippet,
+                    generator=snippet.get("generator"),
+                    cookies=snippet.get("cookies") or [])
+                if detections:
+                    snippet["tech_detail"] = detections[:TECH_DETECT_CAP]
+                    for pv in tech_detect.as_versions(detections):
+                        if pv not in versions:
+                            versions.append(pv)
+            except Exception as e:
+                _log("debug", f"tech detect failed for {host}: {type(e).__name__}: {e}")
+            # --- outside-in dependencies ---
+            # Scripts and stylesheets the page loads, from the markup already
+            # in hand (no asset is fetched). `assets` is present only when a
+            # document body was examined, so an empty list means "looked,
+            # none" and absence means "not examined".
+            try:
+                if code.startswith("2") and re.search(r"<(?:html|head|script|link)\b", body_head, re.I):
+                    assets = dependencies.extract_assets(body_head, snippet["url"], cap=ASSET_CAP)
+                    snippet["assets"] = assets
+                    for pv in dependencies.as_versions(assets):
+                        if pv not in versions:
+                            versions.append(pv)
+            except Exception as e:
+                _log("debug", f"dependency extraction failed for {host}: {type(e).__name__}: {e}")
             if versions:
                 snippet["versions"] = versions
             return probe, snippet
@@ -1089,6 +1250,20 @@ def record_scan_event(slug, mode, fingerprint_len, summary=None, note=""):
         },
         "note": note or "",
     }
+    if ev["kind"] == "scan":
+        # Use the exact file snapshot read above, outside the non-reentrant
+        # org lock. Correlation and AI-only events never become scan points.
+        try:
+            ev["posture"] = cc.scorecard_from_snapshot(
+                (cc.REGISTRY.get(slug) or {}).get("domains") or [],
+                d.get("meta") or {}, d.get("findings") or [], explain=False)["snapshot"]
+        except Exception as e:
+            _log("warn", f"score history unavailable for {slug}: {type(e).__name__}: {e}")
+        try:
+            ev["dependencies"] = cc.dependency_snapshot(
+                d.get("meta") or {}, (cc.REGISTRY.get(slug) or {}).get("domains") or [])
+        except Exception as e:
+            _log("warn", f"dependency history unavailable for {slug}: {type(e).__name__}: {e}")
     return append_history(slug, ev)
 
 
@@ -2240,7 +2415,7 @@ def synthesize_surface_findings(slug, snippets, reached, services=None, enumerat
                 seq += 1
                 cat = infra_cat or "Internet-facing service"
                 sev = infra_sev or "INFO"
-                evidence = dict(s)
+                evidence = {k: v for k, v in s.items() if k != "assets"}
                 evidence["port"] = wport
                 if open_ports:
                     evidence["services"] = open_ports   # informational: full port map
@@ -2429,13 +2604,21 @@ def synthesize_cert_findings(slug, certs):
     ts = time.strftime("%Y%m%d%H%M%S")
     seq = 0
     for h in sorted(certs):
+        if len(out) >= MAX_CERT_FINDINGS:
+            break
         c = certs.get(h) or {}
         port = int(c.get("port") or 443)
         issues = []
         if c.get("expired"):
             issues.append("expired")
+        elif c.get("expiring_soon"):
+            issues.append("expiring soon")
         if c.get("self_signed"):
             issues.append("self-signed")
+        if c.get("hostname_ok") is False:
+            issues.append("hostname mismatch")
+        if c.get("chain_trusted") is False and not c.get("self_signed"):
+            issues.append("untrusted chain")
         if not issues:
             continue
         key = (str(h).strip().lower(), "tls certificate")
@@ -2443,21 +2626,36 @@ def synthesize_cert_findings(slug, certs):
             continue
         seq += 1
         expired = "expired" in issues
+        soon = "expiring soon" in issues
+        mismatch = "hostname mismatch" in issues
         days = c.get("days_left")
         desc = "TLS certificate on %s is %s" % (h, " and ".join(issues))
         if expired and days is not None:
             desc += " (expired %d day(s) ago, notAfter %s)" % (-int(days), c.get("not_after") or "?")
-        elif expired:
+        elif days is not None:
+            desc += " (expires in %d day(s), notAfter %s)" % (int(days), c.get("not_after") or "?")
+        else:
             desc += " (notAfter %s)" % (c.get("not_after") or "?")
         if c.get("issuer_cn"):
             desc += " Issuer CN: %s." % c.get("issuer_cn")
+        if mismatch:
+            desc += (" The certificate's subject/SANs do not cover this hostname, so "
+                     "clients cannot validate it and see a name-mismatch warning.")
+        if c.get("chain_error"):
+            desc += " Chain verification failed: %s." % c.get("chain_error")
+        if expired or mismatch:
+            sev = "MEDIUM"
+        elif soon:
+            sev = "LOW"
+        else:
+            sev = "LOW"
         out.append({
             "id": "TLS-%s-%s-%02d" % (_slugify(slug), ts, seq),
             "title": "%s TLS certificate" % (" and ".join(issues).capitalize()),
             "target": h,
             "ip": None,
             "port": port,
-            "severity": "MEDIUM" if expired else "LOW",
+            "severity": sev,
             "category": "TLS certificate",
             "status": "OPEN",
             "status_detail": "SCAN-DETECTED (TLS handshake)",
@@ -2466,12 +2664,20 @@ def synthesize_cert_findings(slug, certs):
             "source": "scan-tls",
             "description": desc,
             "impact": ("Clients can observe a MITM on this host; expired certs break trust "
-                       "and may allow interception." if expired
-                       else "Self-signed cert indicates a non-CA-issued identity; verify the host is intended."),
+                       "and may allow interception." if expired else
+                       "Clients see a certificate warning and cannot verify host identity, "
+                       "normalising the habit of clicking through TLS errors." if mismatch else
+                       "Certificate expiry will break trust for users and integrations unless "
+                       "renewed before the notAfter date." if soon else
+                       "Self-signed cert indicates a non-CA-issued identity; verify the host is intended."),
             "evidence": {"port": port, **{k: v for k, v in c.items() if v is not None}},
             "proof_chain": ["TLS certificate inspection: %s:%d (stdlib handshake, CERT_NONE)" % (h, port)],
             "remediation": ["Renew/reissue the certificate from a trusted CA and redeploy."
                             if expired else
+                            "Renew the certificate before the notAfter date (automate ACME renewal)."
+                            if soon else
+                            "Reissue the certificate with this hostname in the SAN list."
+                            if mismatch else
                             "Replace the self-signed certificate with a CA-issued one or document why it is acceptable."],
             "related_cves": [],
             "found_date": time.strftime("%Y-%m-%d"),
@@ -2480,6 +2686,157 @@ def synthesize_cert_findings(slug, certs):
             "status_history": [{"at": time.strftime("%Y-%m-%d"), "from": "", "to": "OPEN",
                                 "by": "scan", "note": "TLS certificate inspection"}],
         })
+    return out
+
+
+def synthesize_dns_findings(slug, dns_results):
+    """Deterministic findings from DNS / email-authentication posture.
+
+    One finding per (domain, failing check) so an operator can work each item
+    independently: spoofable mail (SPF/DMARC), unsigned zone, unauthorised CA
+    issuance (CAA), untrusted SMTP transport (MTA-STS), and dangling-CNAME
+    subdomain takeover (per host).
+
+    Everything here is evidence-based: a missing record is a posture gap, not
+    a compromise, and the wording says so. DKIM misses are skipped entirely —
+    custom selectors make absence unprovable, and a finding we cannot stand
+    behind is worse than no finding.
+
+    Deduped by (target, category) and keyed through identity_key so a check
+    that starts failing later produces a new finding rather than being hidden
+    behind the old one. Returns new finding dicts (NOT persisted).
+    """
+    out = []
+    existing = _existing_identity_keys(slug)
+    ts = time.strftime("%Y%m%d%H%M%S")
+    seq = 0
+
+    check_titles = {
+        "spf": "Email authentication: SPF",
+        "dmarc": "Email authentication: DMARC",
+        "caa": "Certificate issuance: CAA",
+        "dnssec": "DNS integrity: DNSSEC",
+        "mta_sts": "SMTP transport security: MTA-STS",
+        "takeover": "Subdomain takeover risk",
+    }
+    check_impact = {
+        "spf": "Without a restrictive SPF policy, anyone can send mail claiming to "
+               "be from this domain, which is the basis of phishing and BEC.",
+        "dmarc": "Without DMARC enforcement, receivers have no instruction to "
+                 "reject unauthenticated mail, so spoofed messages are delivered.",
+        "caa": "Without CAA, any public CA may issue a certificate for this domain, "
+               "widening the blast radius of a CA compromise or mis-issuance.",
+        "dnssec": "Without DNSSEC, DNS answers can be forged in transit, enabling "
+                  "traffic redirection and cache poisoning.",
+        "mta_sts": "Without MTA-STS, SMTP connections can be downgraded to plaintext "
+                   "or intercepted by a network attacker.",
+        "takeover": "A dangling CNAME lets a third party claim the target and serve "
+                    "content on your domain — full impersonation and cookie theft.",
+    }
+    check_remediation = {
+        "spf": ["Publish an SPF record ending in -all, and keep DNS-querying "
+                "mechanisms within the RFC 7208 limit of 10."],
+        "dmarc": ["Publish a DMARC record (start at p=none with rua for visibility, "
+                  "then move to p=quarantine and p=reject)."],
+        "caa": ["Publish CAA records naming the CAs you actually use, plus an "
+                "iodef reporting address."],
+        "dnssec": ["Sign the zone and publish a DS record at the registrar to "
+                   "complete the chain of trust."],
+        "mta_sts": ["Publish an MTA-STS policy in DNS plus the HTTPS policy file, "
+                    "and add a TLS-RPT reporting address."],
+        "takeover": ["Remove the dangling CNAME or re-register/claim the target "
+                     "resource in the third-party service."],
+    }
+
+    for res in dns_results or []:
+        domain = str(res.get("domain") or "").strip().lower()
+        if not domain:
+            continue
+        checks = res.get("checks") or {}
+
+        # --- per-check posture findings (one per domain+check) ---------------
+        for check in ("spf", "dmarc", "caa", "dnssec", "mta_sts"):
+            c = checks.get(check) or {}
+            sev = c.get("severity")
+            msgs = c.get("issues") or []
+            if not sev or sev == "INFO" or not msgs:
+                continue
+            # dnssec "unknown" (resolver unavailable) is not a finding
+            if check == "dnssec" and c.get("enabled") is None:
+                continue
+            ident = "dns|%s|%s" % (domain, check)
+            if ident in existing:
+                continue
+            seq += 1
+            out.append({
+                "id": "DNS-%s-%s-%02d" % (_slugify(slug), ts, seq),
+                "title": "%s — %s" % (check_titles[check], msgs[0][:90]),
+                "target": domain,
+                "ip": None,
+                "severity": sev,
+                "category": check_titles[check].lower(),
+                "status": "OPEN",
+                "status_detail": "SCAN-DETECTED (public DNS)",
+                "positive": False,
+                "mode": "fast",
+                "source": "scan-dns",
+                "description": "DNS posture check on %s: %s" % (domain, "; ".join(msgs)),
+                "impact": check_impact[check],
+                "evidence": {"check": check, "domain": domain,
+                             "severity": sev, "issues": msgs,
+                             "record": c.get("record") or None},
+                "proof_chain": ["Public DNS query for %s records of %s"
+                                % (check, domain)],
+                "remediation": list(check_remediation[check]),
+                "related_cves": [],
+                "found_date": time.strftime("%Y-%m-%d"),
+                "first_seen": time.strftime("%Y-%m-%d"),
+                "last_seen": time.strftime("%Y-%m-%d"),
+                "identity_key": ident,
+                "status_history": [{"at": time.strftime("%Y-%m-%d"), "from": "",
+                                    "to": "OPEN", "by": "scan",
+                                    "note": "DNS posture assessment"}],
+            })
+
+        # --- takeover: one finding per affected host ------------------------
+        for t in (checks.get("takeover") or []):
+            host = str(t.get("host") or "").strip().lower()
+            if not host:
+                continue
+            ident = "dns|%s|takeover" % host
+            if ident in existing:
+                continue
+            seq += 1
+            out.append({
+                "id": "DNS-%s-%s-%02d" % (_slugify(slug), ts, seq),
+                "title": "Subdomain takeover risk — dangling CNAME to %s" % t.get("provider"),
+                "target": host,
+                "ip": None,
+                "severity": t.get("severity") or "HIGH",
+                "category": check_titles["takeover"].lower(),
+                "status": "OPEN",
+                "status_detail": "SCAN-DETECTED (dangling CNAME)",
+                "positive": False,
+                "mode": "fast",
+                "source": "scan-dns",
+                "description": "%s is a CNAME to %s (%s), which no longer resolves. "
+                               "A third party who claims that name can serve content "
+                               "on %s." % (host, t.get("target"), t.get("provider"), host),
+                "impact": check_impact["takeover"],
+                "evidence": {"check": "takeover", "cname": t.get("target"),
+                             "provider": t.get("provider")},
+                "proof_chain": ["CNAME %s -> %s (target does not resolve)"
+                                % (host, t.get("target"))],
+                "remediation": list(check_remediation["takeover"]),
+                "related_cves": [],
+                "found_date": time.strftime("%Y-%m-%d"),
+                "first_seen": time.strftime("%Y-%m-%d"),
+                "last_seen": time.strftime("%Y-%m-%d"),
+                "identity_key": ident,
+                "status_history": [{"at": time.strftime("%Y-%m-%d"), "from": "",
+                                    "to": "OPEN", "by": "scan",
+                                    "note": "dangling CNAME check"}],
+            })
     return out
 
 
@@ -2681,7 +3038,9 @@ def _refresh_finding_evidence(fs, snippets, services):
         for k in stale_keys:
             ev.pop(k, None)
         if isinstance(s, dict):
-            ev.update(s)
+            # the asset list belongs to the dependency inventory, not to
+            # every finding on the host
+            ev.update({k: v for k, v in s.items() if k != "assets"})
         open_ports = svc.get("open") or {}
         banners = svc.get("banners") or {}
         if per_port is not None:
@@ -2732,6 +3091,32 @@ def _existing_target_category_keys(slug):
         for x in (d.get("findings") or []):
             keys.add((str(x.get("target", "")).strip().lower(),
                       str(x.get("category", "")).strip().lower()))
+    except Exception:
+        pass
+    return keys
+
+
+def _existing_identity_keys(slug):
+    """Set of identity_key values already recorded for an org.
+
+    Used by synthesizers whose findings carry their own explicit identity_key
+    (DNS posture checks, where the dedup unit is domain+check rather than
+    target+category and a check that starts failing later must surface as a
+    new finding).
+    """
+    keys = set()
+    try:
+        with open(cc.org_findings_path(slug)) as f:
+            d = json.load(f)
+        for x in (d.get("findings") or []):
+            ik = str(x.get("identity_key") or "").strip()
+            if ik:
+                keys.add(ik)
+                continue
+            try:
+                keys.add(cc.identity_key(x))
+            except Exception:
+                pass
     except Exception:
         pass
     return keys
@@ -2960,10 +3345,11 @@ def synthesize_cve_findings(slug, snippets, nvd=None):
         if key in existing_keys:
             continue
         seq += 1
-        # map CVEs are all >= 7.0; cap at HIGH and downgrade when the observed
-        # version carries too little information (single numeric component)
+        # Cap severe advisory matches at HIGH; never promote a moderate/low
+        # advisory. Sparse version evidence downgrades high matches further.
         conf = cve_match.worst_confidence(matches)
-        sev = "HIGH" if conf == "medium" else "MEDIUM"
+        worst = min((m["severity"] for m in matches), key=lambda s: cc._SEV_ORDER.get(s, 9))
+        sev = ("HIGH" if conf == "medium" else "MEDIUM") if worst in ("CRITICAL", "HIGH") else worst
         cves = [m["cve"] for m in matches]
         ver_txt = ", ".join("%s %s" % (m["product"], m["version"]) for m in matches[:4])
         ev = {k: s[k] for k in ("url", "code", "server", "x-powered-by", "title")
@@ -3002,7 +3388,7 @@ def synthesize_cve_findings(slug, snippets, nvd=None):
             "mode": "fast",
             "source": "scan-cve",
             "description": "Disclosed software versions on %s (%s) match %d "
-                           "high-impact CVE(s) in the local advisory map: %s."
+                           "CVE(s) in the local advisory map: %s."
                            % (h, ver_txt, len(matches),
                               ", ".join(cves[:6])),
             "impact": "If the affected configuration is in use, the host may be "
@@ -3532,10 +3918,11 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
     _stage_done("services")
 
     # --- TLS certificate inspection: keyed off TCP reachability of TLS ports,
-    # NOT off HTTPS-fingerprint success. curl (without --insecure) fails the
-    # HTTPS fetch precisely when a cert is expired/self-signed/hostname-
-    # mismatched, so gating on the https:// snippet skipped exactly the hosts
-    # whose certs needed review. The service probe proves 443/8443 reachability
+    # NOT off HTTPS-fingerprint success. The fingerprint fetch can still fail
+    # on TLS (handshake errors, non-HTTP services, timeouts), and before it
+    # used --insecure it failed precisely on expired/self-signed/mismatched
+    # certs, so gating on the https:// snippet skipped exactly the hosts whose
+    # certs needed review. The service probe proves 443/8443 reachability
     # independently of cert validity.
     if service_candidates:
         tls_hosts = []
@@ -3575,6 +3962,29 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
 
     _stage_done("tls")
 
+    # --- DNS / email-authentication posture (SPF, DMARC, DKIM, DNSSEC, CAA,
+    # MTA-STS) plus dangling-CNAME takeover checks on discovered hosts.
+    # Bounded and fail-open: a resolver problem degrades to "unknown" for that
+    # check and never fails the scan. Runs BEFORE the org lock (network I/O).
+    dns_results = []
+    if DNS_POSTURE_ENABLED:
+        _emit(on_progress, "capture", "DNS posture (SPF/DMARC/DKIM/DNSSEC/CAA)")
+        try:
+            import dns_posture
+            known_hosts = list(hosts.keys())[:DNS_TAKEOVER_HOST_CAP]
+            for dom in domains[:DNS_MAX_DOMAINS]:
+                try:
+                    dns_results.append(dns_posture.assess(dom, hosts=known_hosts))
+                except Exception as e:
+                    _log("debug", f"dns posture failed for {dom}: "
+                                  f"{type(e).__name__}: {e}")
+            if dns_results:
+                _emit(on_progress, "capture",
+                      f"{len(dns_results)} domain(s) assessed for DNS posture")
+        except Exception as e:
+            _log("warn", f"DNS posture stage unavailable: {type(e).__name__}: {e}")
+    _stage_done("dns")
+
     # --- optional NVD enrichment for matched CVEs (CTI_NVD_ENRICH=1) ---
     # runs BEFORE the org lock: network calls must never hold the write lock.
     # Fail-open by design — any error leaves the deterministic result alone.
@@ -3590,6 +4000,20 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
             _log("warn", f"NVD enrichment failed for {slug}: "
                          f"{type(e).__name__}: {e}")
     _stage_done("nvd")
+
+    # --- optional live advisories from cve.now (CTI_CVE_NOW=1) ---
+    # Same contract as NVD enrichment: network outside the org lock,
+    # fail-open, captured into scan meta so the rating stays a function of
+    # this snapshot. Only package names/versions and CVE ids are sent.
+    live_cves = None
+    if live_cve.enabled() and snippets:
+        _emit(on_progress, "capture", "live advisories (cve.now)")
+        live_cves = live_cve.collect(snippets)
+        _emit(on_progress, "capture",
+              f"cve.now: {len(live_cves['cves'])} advisories for "
+              f"{len(live_cves['packages'])} package(s)"
+              + ("" if live_cves["complete"] else " (partial)"))
+    _stage_done("live_cve")
 
     # --- findings.json: preserve existing findings, merge scan meta atomically ---
     # baseline.txt is written inside the same org lock as findings.json so a
@@ -3679,6 +4103,17 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
                 "fingerprints": {h: s for h, s in snippets.items()},
                 # per-host open service ports (TCP connect scan), {host: {ip, open: {port: svc}}}
                 "services": services,
+                # full TLS certificate inventory for every inspected host, so
+                # healthy certs are queryable too (not just the ones that
+                # produced a finding). {host: {port, issuer_cn, not_after, ...}}
+                "certificates": {h: c for h, c in certs.items()},
+                # DNS / email-authentication posture per registered domain
+                # (SPF, DMARC, DKIM, DNSSEC, CAA, MTA-STS + takeover checks)
+                "dns_posture": dns_results,
+                # live advisories captured for this snapshot (None when the
+                # cve.now source is off, so a previous scan's intel never
+                # outlives the evidence it was fetched for)
+                "live_cves": live_cves,
                 # reconciliation bookkeeping for this scan
                 "reconcile": {
                     "observed": recon.get("observed", 0),
@@ -3706,6 +4141,7 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
                         slug, snippets, reached, services,
                         enumerated=list(hosts.keys()))),
                     ("tls", lambda: synthesize_cert_findings(slug, certs)),
+                    ("dns", lambda: synthesize_dns_findings(slug, dns_results)),
                     ("login", lambda: synthesize_login_findings(slug, snippets)),
                     ("version", lambda: synthesize_version_findings(slug, snippets)),
                     ("cve", lambda: synthesize_cve_findings(slug, snippets,

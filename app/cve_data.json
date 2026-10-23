@@ -1,7 +1,7 @@
 {
   "_meta": {
-    "updated": "2026-08-22",
-    "policy": "High-impact (CVSS >= 7.0), well-known CVEs only. Matches are advisory: findings are tiered CORRELATED and must be verified against the affected range before action. Ranges are OR-combined; operators within a range are AND-combined. Versions are compared by leading numeric components (7.1p2 -> 7.1).",
+    "updated": "2026-10-23",
+    "policy": "Selected, well-known CVEs, primarily high-impact. Severity follows the cited advisory; moderate advisories are not promoted to high. Matches are advisory: findings are tiered CORRELATED and must be verified against the affected range before action. Ranges are OR-combined; operators within a range are AND-combined. Versions are compared by leading numeric components (7.1p2 -> 7.1).",
     "confidence": "single numeric component (e.g. 'Apache/2') -> low; two or more components -> medium"
   },
   "products": {
@@ -35,10 +35,7 @@
       "cves": [
         {"cve": "CVE-2024-6387", "severity": "HIGH", "cvss": 8.1, "fix_version": "9.8p1",
          "ranges": [">=8.5,<=9.7"],
-         "summary": "regreSSHion: signal-handler race enables unauthenticated RCE as root (glibc)"},
-        {"cve": "CVE-2023-38408", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "9.3p2",
-         "ranges": [">=5.5,<=9.3"],
-         "summary": "ssh-agent forwarding PKCS#11 command injection enables RCE on the agent host"}
+         "summary": "regreSSHion: signal-handler race enables unauthenticated RCE as root (glibc)"}
       ]
     },
     "php": {
@@ -144,7 +141,72 @@
       "cves": [
         {"cve": "CVE-2019-19844", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "2.2.9",
          "ranges": [">=2.2,<2.2.9", ">=2.1,<2.1.16", ">=1.11,<1.11.27"],
-         "summary": "Password-reset SQL injection / account takeover via crafted reset email (PostgreSQL)"}
+         "summary": "Password-reset SQL injection / account takeover via crafted reset email (PostgreSQL)"},
+        {"cve": "CVE-2021-35042", "severity": "HIGH", "cvss": 7.5, "fix_version": "3.2.5",
+         "ranges": [">=3.1,<3.1.13", ">=3.2,<3.2.5"],
+         "summary": "SQL injection via unvalidated QuerySet.order_by() input"},
+        {"cve": "CVE-2022-28346", "severity": "HIGH", "cvss": 7.5, "fix_version": "4.0.4",
+         "ranges": [">=2.2,<2.2.28", ">=3.2,<3.2.13", ">=4.0,<4.0.4"],
+         "summary": "SQL injection in QuerySet.annotate()/aggregate() with untrusted dict keys"},
+        {"cve": "CVE-2023-46695", "severity": "HIGH", "cvss": 7.5, "fix_version": "4.2.7",
+         "ranges": [">=4.1,<4.1.13", ">=4.2,<4.2.7"],
+         "summary": "Potential denial of service in UsernameField on Windows (NFKC normalization)"}
+      ]
+    },
+    "rails": {
+      "aliases": ["rails", "ruby on rails", "railties"],
+      "cves": [
+        {"cve": "CVE-2019-5418", "severity": "HIGH", "cvss": 7.5, "fix_version": "5.2.2.1",
+         "ranges": [">=5.0.0,<5.2.2.1", ">=4.2.0,<4.2.11.1"],
+         "summary": "File content disclosure (path traversal) via Accept header in Action View render"},
+        {"cve": "CVE-2020-8163", "severity": "HIGH", "cvss": 7.5, "fix_version": "5.2.4.3",
+         "ranges": [">=5.0.0,<5.2.4.3"],
+         "summary": "Remote code execution via user-supplied locals in the inline method (Action View)"},
+        {"cve": "CVE-2022-32224", "severity": "HIGH", "cvss": 8.8, "fix_version": "7.0.3.1",
+         "ranges": [">=5.2,<5.2.8.1", ">=6.0,<6.0.5.1", ">=6.1,<6.1.6.1", ">=7.0,<7.0.3.1"],
+         "summary": "YAML deserialization can lead to RCE when untrusted YAML is loaded"}
+      ]
+    },
+    "joomla": {
+      "aliases": ["joomla"],
+      "cves": [
+        {"cve": "CVE-2015-8562", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "3.4.6",
+         "ranges": [">=1.5.0,<3.4.6"],
+         "summary": "Unserialize/object injection via HTTP headers enables unauthenticated RCE"},
+        {"cve": "CVE-2023-23752", "severity": "HIGH", "cvss": 7.5, "fix_version": "4.2.8",
+         "ranges": [">=4.0.0,<4.2.8"],
+         "summary": "Improper access check on the webservice API exposes config incl. credentials"}
+      ]
+    },
+    "jquery": {
+      "aliases": ["jquery"],
+      "cves": [
+        {"cve": "CVE-2020-11022", "severity": "HIGH", "cvss": 7.5, "fix_version": "3.5.0",
+         "ranges": [">=1.2,<3.5.0"],
+         "summary": "XSS via htmlPrefilter when passing untrusted HTML to DOM manipulation methods"},
+        {"cve": "CVE-2019-11358", "severity": "HIGH", "cvss": 7.5, "fix_version": "3.4.0",
+         "ranges": [">=0.1,<3.4.0"],
+         "summary": "Prototype pollution in jQuery.extend(true, {}, ...) — Object.prototype pollution"}
+      ]
+    },
+    "bootstrap": {
+      "aliases": ["bootstrap"],
+      "cves": [
+        {"cve": "CVE-2019-8331", "severity": "HIGH", "cvss": 7.5, "fix_version": "4.3.1",
+         "ranges": [">=3.0.0,<3.4.1", ">=4.0.0,<4.3.1"],
+         "summary": "XSS in the tooltip/collapse data-parent attribute via untrusted content"},
+        {"cve": "CVE-2024-6484", "severity": "HIGH", "cvss": 7.5, "fix_version": "3.4.1",
+         "ranges": [">=3.0.0,<3.4.1"],
+         "summary": "XSS via the collapse plugin's data-parent selector"}
+      ]
+    },
+    "angularjs": {
+      "aliases": ["angularjs", "angular.js"],
+      "cves": [
+        {"cve": "CVE-2023-26116", "severity": "MEDIUM", "cvss": 5.3, "fix_version": null,
+         "ranges": [">=0.0.0,<=1.8.3"],
+         "source": "https://github.com/advisories/GHSA-2vrf-hf26-jrp5",
+         "summary": "AngularJS angular.copy() regular-expression denial of service; no patched version listed"}
       ]
     },
     "drupal": {
@@ -222,6 +284,74 @@
          "ranges": [">=2.2,<2.2.14", ">=3.0,<3.0.4"],
          "summary": "JSON-RPC profile.idx2 SQL injection enables login bypass and data exfiltration"}
       ]
+    },
+    "openssl": {
+      "aliases": ["openssl", "openssl-fips"],
+      "cves": [
+        {"cve": "CVE-2022-3602", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "3.0.7",
+         "ranges": [">=3.0,<3.0.7"],
+         "summary": "X.509 email address 4-byte buffer overflow in punycode decoding enables crash / potential RCE (3.0.x line)"},
+        {"cve": "CVE-2023-0286", "severity": "HIGH", "cvss": 7.4, "fix_version": "3.0.8",
+         "ranges": [">=3.0,<3.0.8"],
+         "summary": "X.400 address type confusion in X.509 GeneralName enables cross-type read and DoS"}
+      ]
+    },
+    "big-ip": {
+      "aliases": ["big-ip", "bigip", "f5 big-ip", "f5", "big-ip apm"],
+      "cves": [
+        {"cve": "CVE-2022-1388", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "16.1.3",
+         "ranges": [">=16.1,<16.1.3", ">=15.1,<15.1.6", ">=14.1,<14.1.5",
+                    ">=13.1,<13.1.5", ">=12.1,<12.1.7"],
+         "summary": "iControl REST authentication bypass enables unauthenticated remote command execution as root"},
+        {"cve": "CVE-2023-46747", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "17.1.1",
+         "ranges": [">=17.1,<17.1.1", ">=16.1,<16.1.4", ">=15.1,<15.1.9", ">=14.1,<14.1.5"],
+         "summary": "Configuration utility authentication bypass (request smuggling) enables unauthenticated admin access"}
+      ]
+    },
+    "moveit": {
+      "aliases": ["moveit", "moveit transfer", "moveit automation", "progress moveit"],
+      "cves": [
+        {"cve": "CVE-2023-34362", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "2023.0.1",
+         "ranges": ["<2023.0.1"],
+         "summary": "SQL injection in the MOVEit Transfer web app enables unauthenticated RCE (Cl0p mass exploitation)"}
+      ]
+    },
+    "citrix": {
+      "aliases": ["citrix", "netscaler", "citrix adc", "citrix gateway", "netscaler adc"],
+      "cves": [
+        {"cve": "CVE-2023-3519", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "13.1.49",
+         "ranges": [">=13.0,<13.0.92", ">=13.1,<13.1.49", ">=12.1,<12.1.65"],
+         "summary": "Unauthenticated stack overflow in NetScaler ADC/Gateway enables remote code execution"},
+        {"cve": "CVE-2019-19781", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "13.0.47.24",
+         "ranges": [">=10.5,<10.5.70", ">=11.1,<11.1.63", ">=12.0,<12.0.63", ">=12.1,<12.1.55", ">=13.0,<13.0.47"],
+         "summary": "Path traversal in the ADC/Gateway VPN portal enables unauthenticated RCE"}
+      ]
+    },
+    "jira": {
+      "aliases": ["jira", "atlassian jira", "jira software", "jira core"],
+      "cves": [
+        {"cve": "CVE-2019-11581", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "8.4.0",
+         "ranges": [">=7.6,<7.13.10", ">=8.0,<8.4.0"],
+         "summary": "Server-side template injection in the Contact Administrators form enables unauthenticated RCE"}
+      ]
+    },
+    "exchange": {
+      "aliases": ["exchange", "microsoft exchange", "exchange server", "owa"],
+      "cves": [
+        {"cve": "CVE-2021-34473", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "15.2.792.10",
+         "ranges": [">=15.0,<15.1.2242", ">=15.1,<15.1.2308", ">=15.2,<15.2.792"],
+         "summary": "ProxyShell: path confusion in Autodiscover enables unauthenticated RCE (chained with CVE-2021-34523 / 31207)"},
+        {"cve": "CVE-2021-26855", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "15.0.1497.2",
+         "ranges": [">=15.0,<15.0.1497", ">=15.1,<15.1.2176", ">=15.2,<15.2.792"],
+         "summary": "ProxyLogon: SSRF in the Exchange HTTP protocol enables authentication bypass and RCE"}
+      ]
     }
-  }
+  },
+  "withdrawn": [
+    {"cve": "CVE-2023-38408",
+     "product": "openssh",
+     "withdrawn": "2026-10-23",
+     "reason": "ssh-agent PKCS#11 flaw: exploited when a client forwards its agent to a malicious server. An sshd banner says nothing about client agent use, so matching it against server versions produced false critical exposure.",
+     "source": "https://nvd.nist.gov/vuln/detail/CVE-2023-38408"}
+  ]
 }

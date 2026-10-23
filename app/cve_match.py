@@ -19,13 +19,14 @@ import time
 _CVE_ID_RE = re.compile(r"CVE-\d{4}-\d{4,7}")
 
 _map_cache = None
+_withdrawn_cache = frozenset()
 _alias_index = None
 _map_lock = threading.Lock()
 
 
 def load_map():
     """Load and validate cve_data.json once per process."""
-    global _map_cache
+    global _map_cache, _withdrawn_cache
     if _map_cache is not None:
         return _map_cache
     with _map_lock:
@@ -39,20 +40,39 @@ def load_map():
             for cve in entry.get("cves", []):
                 if not _CVE_ID_RE.fullmatch(str(cve.get("cve", ""))):
                     raise ValueError("invalid CVE id in cve_data.json: %r" % cve.get("cve"))
-                if str(cve.get("severity", "")).upper() not in ("CRITICAL", "HIGH"):
+                if str(cve.get("severity", "")).upper() not in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
                     raise ValueError("invalid severity for %s" % cve.get("cve"))
                 if not cve.get("ranges"):
                     raise ValueError("missing ranges for %s" % cve.get("cve"))
+        withdrawn = set()
+        for w in data.get("withdrawn") or []:
+            cid = str((w or {}).get("cve", "")).upper()
+            if not _CVE_ID_RE.fullmatch(cid) or not (w or {}).get("reason"):
+                raise ValueError("withdrawn entries need a CVE id and a reason: %r" % w)
+            withdrawn.add(cid)
+        _withdrawn_cache = frozenset(withdrawn)
         _map_cache = products
         return _map_cache
 
 
 def reset_cache():
     """Test hook: force the next load_map() to re-read the file."""
-    global _map_cache, _alias_index
+    global _map_cache, _withdrawn_cache, _alias_index
     with _map_lock:
         _map_cache = None
+        _withdrawn_cache = frozenset()
         _alias_index = None
+
+
+def withdrawn_ids():
+    """CVE ids deliberately removed from the map, with a recorded reason.
+
+    A version seen on a server cannot indicate these (for example a
+    client-side flaw), so historical findings that carry one must not count
+    toward the current posture either.
+    """
+    load_map()
+    return _withdrawn_cache
 
 
 # canonical key -> product entry; alias (lowercased, trimmed) -> canonical key
@@ -157,7 +177,7 @@ def _confidence_for(vkey):
     return "medium" if len(vkey) >= 2 else "low"
 
 
-_SEV_RANK = {"CRITICAL": 0, "HIGH": 1}
+_SEV_RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 
 
 def match_cves(versions, cap=12):
@@ -173,10 +193,15 @@ def match_cves(versions, cap=12):
     for v in versions or []:
         if not isinstance(v, dict):
             continue
-        key = normalize_product(v.get("product"))
+        product = str(v.get("product") or "").strip().lower()
+        version = str(v.get("version") or "")
+        # Legacy fingerprints called AngularJS "angular". Only its 1.x
+        # versions can use that alias; modern Angular is a separate product.
+        if product == "angular" and _vkey(version)[:1] == (1,):
+            product = "angularjs"
+        key = normalize_product(product)
         if not key:
             continue
-        version = str(v.get("version") or "")
         vkey = _vkey(version)
         if not vkey:
             continue

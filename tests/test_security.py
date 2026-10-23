@@ -209,8 +209,12 @@ def test_job_success_status():
     m._jobs.clear()
 
 
-def test_provider_url_validation():
+def test_provider_url_validation(monkeypatch):
     import ai_providers
+    import socket
+    # Test URL policy with deterministic DNS, independent of network access.
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **kw: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))])
     assert ai_providers._validate_base_url("https://api.openai.com/v1", "openai-compatible", "OPENAI_API_KEY")
     assert ai_providers._validate_base_url("http://127.0.0.1:11434", "ollama", None)
     assert ai_providers._validate_base_url("http://localhost:11434", "ollama", None)
@@ -220,6 +224,10 @@ def test_provider_url_validation():
     assert not ai_providers._validate_base_url("https://169.254.169.254/v1", "openai-compatible", None)
     assert not ai_providers._validate_base_url("https://user:pass@api.openai.com/v1", "openai-compatible", None)
     assert not ai_providers._validate_base_url("ftp://api.openai.com/v1", "openai-compatible", None)
+    def unavailable(*args, **kwargs):
+        raise socket.gaierror("resolver unavailable")
+    monkeypatch.setattr(socket, "getaddrinfo", unavailable)
+    assert not ai_providers._validate_base_url("https://api.openai.com/v1", "openai-compatible", "OPENAI_API_KEY")
 
 
 def test_provider_api_key_env_allowed():

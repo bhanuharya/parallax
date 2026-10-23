@@ -54,8 +54,8 @@ def test_map_loads_and_is_wellformed():
     for key, entry in products.items():
         assert entry.get("aliases"), key
         for c in entry["cves"]:
-            assert c["severity"] in ("CRITICAL", "HIGH")
-            assert isinstance(c["cvss"], (int, float)) and c["cvss"] >= 7.0
+            assert c["severity"] in ("CRITICAL", "HIGH", "MEDIUM", "LOW")
+            assert isinstance(c["cvss"], (int, float)) and 0 <= c["cvss"] <= 10
             assert c["ranges"], c["cve"]
             assert c["summary"]
     # load_map re-raises on a malformed map (validation runs at load)
