@@ -23,7 +23,10 @@ def _patch(monkeypatch, tmp_path, subs, resolve_map, open_by_ip):
                         lambda ip, port, timeout:
                         "reachable" if str(port) in open_by_ip.get(ip, ())
                         else "closed")
-    monkeypatch.setattr(scanner, "_grab_banner", lambda *a, **k: None)
+    # MySQL greets first, so an open 3306 needs its handshake to count
+    monkeypatch.setattr(scanner, "_grab_banner",
+                        lambda ip, port, *a, **k: "5.7.44-log mysql_native_password"
+                        if int(port) == 3306 else None)
     monkeypatch.setattr(scanner, "_tls_cert", lambda *a, **k: None)
     monkeypatch.setattr(scanner, "_wildcard_cache", {})
     monkeypatch.setattr(cc, "org_findings_path",

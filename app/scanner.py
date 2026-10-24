@@ -1106,6 +1106,206 @@ _SERVICE_PORTS = {
 }
 
 
+# --------------------------------------------------------------------------
+# service verification — a TCP accept alone does not prove a service. Load
+# balancers and firewalls often complete the handshake on ports nothing
+# listens behind (or on every port), so each open port is checked against
+# what actually answered before it counts as exposed.
+# --------------------------------------------------------------------------
+# protocols whose server speaks first: a real server greets within the banner
+# timeout, so a silent accept on their port is a middlebox, not the service
+_GREETING_FIRST = {"ftp", "ssh", "pop3", "imap", "mysql", "vnc"}
+# unassigned high ports no real service uses; a host that accepts these
+# accepts everything, so its unconfirmed ports are artifacts
+_CANARY_PORTS = (47391, 51973, 58913)
+BLANKET_CANARY_MIN = _env_int("CTI_BLANKET_CANARY_MIN", 4)  # unconfirmed open ports before canaries
+_CANARY_ACCEPT_MIN = 2
+_WEB_PORT_SCHEMES = {80: "http", 443: "https"}
+
+
+def _identify_protocol(banner, expected=""):
+    """Protocol a greeting/response proves, or None when it proves nothing."""
+    b = str(banner or "").lstrip()
+    if not b:
+        return None
+    low = b.lower()
+    if b.startswith("SSH-"):
+        return "ssh"
+    if b.startswith("HTTP/"):
+        return "http"
+    if b.startswith("RFB "):
+        return "vnc"
+    if b.startswith("+OK"):
+        return "pop3"
+    if b.startswith("* OK") or b.startswith("* PREAUTH"):
+        return "imap"
+    if re.match(r"220[ -]", b):
+        # FTP and SMTP both greet with 220: the text decides, then the port
+        if "ftp" in low:
+            return "ftp"
+        if re.search(r"smtp|esmtp|postfix|exim|sendmail|mail", low):
+            return "smtp"
+        return expected if expected in ("ftp", "smtp") else "ftp"
+    # MySQL greets with a binary handshake whose server version is readable
+    if re.search(r"mysql_native_password|caching_sha2_password|mariadb|mysql", low) \
+            or (expected == "mysql" and re.search(r"\d+\.\d+\.\d+", low)):
+        return "mysql"
+    if "login:" in low or b.startswith("�"):
+        return "telnet"
+    return None
+
+
+def _verify_services(services, snippets=None, probe=None):
+    """Split each host's open ports into confirmed, plausible and unconfirmed.
+
+    - confirmed: a greeting or HTTP response identified the protocol (the
+      port's service becomes the identified protocol, e.g. HTTP on TCP 21),
+    - plausible: accepted, and its protocol does not greet first (RDP, SMB,
+      PostgreSQL, ...), so a silent accept is expected,
+    - unconfirmed: a greet-first protocol stayed silent, or the host accepts
+      connections on canary ports nothing listens on ("blanket" host).
+
+    In place: `open` keeps confirmed + plausible ports (what ratings and
+    findings use); `unconfirmed`, `port_confidence` and `blanket` record the
+    rest. Returns {"blanket_hosts": n, "unconfirmed_ports": n}.
+    """
+    probe = probe or _tcp_reachable
+    snippets = snippets or {}
+    stats = {"blanket_hosts": 0, "unconfirmed_ports": 0}
+    todo = []
+    for h, svc in (services or {}).items():
+        if not isinstance(svc, dict):
+            continue
+        banners = svc.get("banners") or {}
+        sn = snippets.get(h) or {}
+        web_scheme = str(sn.get("url", "")).split("://", 1)[0].lower()
+        confirmed, plausible, unconfirmed = {}, {}, {}
+        for p, name in (svc.get("open") or {}).items():
+            proto = _identify_protocol(banners.get(p), name)
+            try:
+                pi = int(p)
+            except (TypeError, ValueError):
+                continue
+            if proto:
+                confirmed[p] = proto
+            elif _WEB_PORT_SCHEMES.get(pi) and _WEB_PORT_SCHEMES[pi] == web_scheme:
+                confirmed[p] = name
+            elif name in _GREETING_FIRST:
+                unconfirmed[p] = {"service": name, "reason": "no-greeting"}
+            else:
+                plausible[p] = name
+        todo.append((h, svc, confirmed, plausible, unconfirmed))
+
+    def _canaries(ip):
+        return sum(1 for cp in _CANARY_PORTS if probe(ip, cp, 2.0) == "reachable")
+
+    need = [(h, svc.get("ip")) for h, svc, _c, pl, _u in todo
+            if len(pl) >= BLANKET_CANARY_MIN and svc.get("ip")]
+    accepted = {}
+    if need:
+        with _cf.ThreadPoolExecutor(max_workers=min(8, len(need))) as ex:
+            futs = {ex.submit(_canaries, ip): h for h, ip in need}
+            for fut in _cf.as_completed(futs):
+                try:
+                    accepted[futs[fut]] = fut.result()
+                except Exception:
+                    accepted[futs[fut]] = 0
+    for h, svc, confirmed, plausible, unconfirmed in todo:
+        if accepted.get(h, 0) >= _CANARY_ACCEPT_MIN:
+            for p, name in plausible.items():
+                unconfirmed[p] = {"service": name, "reason": "blanket"}
+            plausible = {}
+            svc["blanket"] = {"canary_ports": list(_CANARY_PORTS), "accepted": accepted[h]}
+            stats["blanket_hosts"] += 1
+        svc["open"] = {**confirmed, **plausible}
+        svc["port_confidence"] = {**{p: "high" for p in confirmed},
+                                  **{p: "medium" for p in plausible}}
+        if unconfirmed:
+            svc["unconfirmed"] = unconfirmed
+            stats["unconfirmed_ports"] += len(unconfirmed)
+    return stats
+
+
+# --------------------------------------------------------------------------
+# service classification — by the service observed on the port, never by the
+# hostname (a name like "db-dev" says nothing about what answers on TCP 21)
+# --------------------------------------------------------------------------
+_SERVICE_CLASSES = {
+    # service: (label, category, severity, remediation)
+    "telnet": ("Telnet", "Remote access", "HIGH",
+               "Disable Telnet; use SSH through a VPN or bastion."),
+    "rdp": ("RDP", "Remote access", "HIGH",
+            "Remove RDP from the internet; reach it only through a VPN or gateway with MFA."),
+    "vnc": ("VNC", "Remote access", "HIGH",
+            "Remove VNC from the internet; reach it only through a VPN."),
+    "ssh": ("SSH", "Remote access", "LOW",
+            "Restrict SSH to a VPN, bastion or allow-listed addresses; require key-based login."),
+    "smb": ("SMB", "File sharing", "HIGH",
+            "Block SMB (TCP 445) at the internet edge."),
+    "netbios-ssn": ("NetBIOS", "File sharing", "MEDIUM",
+                    "Block NetBIOS (TCP 139) at the internet edge."),
+    "ftp": ("FTP", "File sharing", "MEDIUM",
+            "Replace FTP with SFTP, or restrict it to known addresses; FTP sends credentials in clear text."),
+    "rpcbind": ("RPC portmapper", "Network service", "MEDIUM",
+                "Block rpcbind (TCP 111) at the internet edge."),
+    "mysql": ("MySQL", "Database", "HIGH",
+              "Remove the database from the internet; allow only application hosts."),
+    "postgresql": ("PostgreSQL", "Database", "HIGH",
+                   "Remove the database from the internet; allow only application hosts."),
+    "mssql": ("MSSQL", "Database", "HIGH",
+              "Remove the database from the internet; allow only application hosts."),
+    "redis": ("Redis", "Database", "HIGH",
+              "Remove Redis from the internet; bind it to private addresses and require auth."),
+    "elasticsearch": ("Elasticsearch", "Database", "HIGH",
+                      "Remove Elasticsearch from the internet; require authentication."),
+    "smtp": ("SMTP", "Mail", "INFO",
+             "Expected for mail servers; confirm it is one and that relaying is restricted."),
+    "pop3": ("POP3", "Mail", "LOW",
+             "Prefer POP3S (TCP 995); plain POP3 sends credentials in clear text."),
+    "imap": ("IMAP", "Mail", "LOW",
+             "Prefer IMAPS (TCP 993); plain IMAP sends credentials in clear text."),
+    "imaps": ("IMAPS", "Mail", "INFO",
+              "Expected for mail servers; confirm it is one."),
+    "dns": ("DNS", "Network service", "LOW",
+            "Confirm the server is authoritative only and not an open resolver."),
+    "http": ("HTTP", "Web service", "LOW",
+             "Confirm this web service is meant to be public; restrict it otherwise."),
+    "http-alt": ("HTTP", "Web service", "LOW",
+                 "Confirm this web service is meant to be public; restrict it otherwise."),
+    "https": ("HTTPS", "Web service", "LOW",
+              "Confirm this web service is meant to be public; restrict it otherwise."),
+    "https-alt": ("HTTPS", "Web service", "LOW",
+                  "Confirm this web service is meant to be public; restrict it otherwise."),
+}
+
+# products whose web UI is an admin or operations console (from fingerprint
+# tech detections or the page title, i.e. what the page actually served)
+_ADMIN_PRODUCTS = ("grafana", "kibana", "jenkins", "gitlab", "phpmyadmin", "portainer",
+                   "rabbitmq", "sonarqube", "nexus", "argocd", "argo cd", "prometheus",
+                   "webmin", "cpanel", "plesk", "pgadmin", "adminer", "keycloak",
+                   "traefik", "zabbix", "nagios", "jira", "confluence", "harbor")
+
+
+def _classify_service(name, port):
+    """(label, category, severity, remediation) for a service seen on a port."""
+    label, cat, sev, fix = _SERVICE_CLASSES.get(
+        str(name or "").lower(),
+        (str(name or "unknown").upper(), "Network service", "LOW",
+         "Review whether this service must be publicly reachable; restrict otherwise."))
+    return label, cat, sev, fix
+
+
+def _admin_product(snippet):
+    """Admin/ops console product the page itself identifies, or None."""
+    s = snippet or {}
+    texts = [str(t).lower() for t in (s.get("tech") or [])]
+    texts.append(str(s.get("title") or "").lower())
+    for prod in _ADMIN_PRODUCTS:
+        if any(prod in t for t in texts):
+            return prod
+    return None
+
+
 _FIND_PORT_RE = re.compile(r":(\d{2,5})\b|\bp(\d{2,5})\b")
 
 # service-name aliases per finding category, used to pick the recheck port
@@ -2325,7 +2525,13 @@ _INFRA_PATTERNS = (
 
 
 def _classify_infra(host):
-    """Return (category, severity) for a well-known critical-infrastructure name."""
+    """(name hint, severity) a hostname suggests, e.g. ("VPN / remote access", ...).
+
+    A HINT only: what a name suggests is not evidence of what runs there.
+    Findings take their category, title and severity from the observed
+    service (_classify_service / _admin_product); the hint is kept as
+    context in the evidence and description.
+    """
     label = str(host).lower().rstrip(".").split(".")[0]
     for cat, kws, sev in _INFRA_PATTERNS:
         for kw in kws:
@@ -2344,35 +2550,46 @@ def _web_scheme_port(snippet):
     return None
 
 
-def _tcp_service_finding(slug, ts, seq, h, ip, port, name, banner,
-                         infra_cat=None, infra_sev=None):
-    """One finding per open non-web TCP port.
+def _service_confidence(banner):
+    if banner and _identify_protocol(banner):
+        return "high", "service greeting identified the protocol"
+    return "medium", "TCP connection accepted; this protocol does not greet first"
+
+
+def _tcp_service_finding(slug, ts, seq, h, ip, port, name, banner, name_hint=None):
+    """One finding per verified open non-web TCP port.
 
     Explicit `port` + source scan-services give a stable per-port identity
     (surface-tcp|host|port), so recheck probes exactly this port and the
-    reconciliation pass can retire it individually when it closes.
+    reconciliation pass can retire it individually when it closes. Category,
+    title and severity come from the service seen on the port; the hostname
+    hint is context only.
     """
     p = int(port)
-    cat = infra_cat or "Internet-facing service"
-    sev = infra_sev or "INFO"
+    label, cat, sev, fix = _classify_service(name, p)
+    conf, conf_reason = _service_confidence(banner)
     ev = {"ip": ip, "port": p, "services": {str(p): name}}
+    if name_hint:
+        ev["name_hint"] = name_hint
     proof = ["tcp-connect %s:%s" % (ip or h, p)]
-    desc = "Open service: %s on TCP %d." % (name, p)
-    if infra_cat:
-        desc += " Classified: %s." % infra_cat
+    desc = "Open service: %s on TCP %d." % (label, p)
     if banner:
         ev["banners"] = {str(p): banner}
         proof.append("banner %d: %s" % (p, str(banner)[:100]))
-        desc += " Banner: %s." % str(banner)[:70]
+        desc += " Greeting: %s." % str(banner)[:70]
+    if name_hint:
+        desc += " Hostname suggests %s (not used to classify)." % name_hint.lower()
     return {
         "id": "SRV-%s-%s-%02d" % (_slugify(slug), ts, seq),
-        "title": ("%s service exposed on TCP %d" % (infra_cat, p)) if infra_cat
-                 else ("Exposed %s service (TCP %d)" % (name, p)),
+        "title": "Exposed %s service (TCP %d)" % (label, p),
         "target": h,
         "ip": ip,
         "port": p,
         "severity": sev,
         "category": cat,
+        "classified_by": "service",
+        "confidence": conf,
+        "confidence_reason": conf_reason,
         "status": "OPEN",
         "status_detail": "SCAN-DETECTED (TCP connect)" + (" + banner" if banner else ""),
         "positive": False,
@@ -2382,7 +2599,7 @@ def _tcp_service_finding(slug, ts, seq, h, ip, port, name, banner,
         "impact": "Expanded external attack surface (non-HTTP service exposure).",
         "evidence": ev,
         "proof_chain": proof,
-        "remediation": ["Limit exposure via firewall/ACL; disable or restrict any service not required publicly."],
+        "remediation": [fix],
         "related_cves": [],
         "found_date": time.strftime("%Y-%m-%d"),
         "first_seen": time.strftime("%Y-%m-%d"),
@@ -2444,13 +2661,15 @@ def synthesize_surface_findings(slug, snippets, reached, services=None, enumerat
         svc = services.get(h) or {}
         open_ports = svc.get("open") or {}
         ip = svc.get("ip")
-        infra_cat, infra_sev = _classify_infra(h)
+        name_hint = _classify_infra(h)[0]
         port_list = ", ".join(
             f"{p}/{name}" for p, name in sorted(open_ports.items(), key=lambda kv: int(kv[0])))
 
-        # enumerated-only critical infra: no HTTP fingerprint, no open service port
+        # enumerated-only host whose NAME suggests infrastructure: no HTTP
+        # fingerprint, no verified port. Inventory context, not exposure, so
+        # INFO with low confidence: the name is the only evidence.
         if not s and not open_ports:
-            if not infra_cat:
+            if not name_hint:
                 continue
             # legacy behavior: suppress enum noise once ANY finding exists for target
             if t in existing_targets:
@@ -2462,21 +2681,24 @@ def synthesize_surface_findings(slug, snippets, reached, services=None, enumerat
             seq += 1
             rec = {
                 "id": "SRV-%s-%s-%02d" % (_slugify(slug), ts, seq),
-                "title": "Critical infrastructure (%s)" % infra_cat,
+                "title": "Unreachable host named like %s" % name_hint.lower(),
                 "target": h,
                 "ip": None,
-                "severity": infra_sev or "LOW",
-                "category": infra_cat,
+                "severity": "INFO",
+                "category": "Unreachable host",
+                "classified_by": "service",
+                "confidence": "low",
+                "confidence_reason": "hostname only; no service answered",
                 "status": "OPEN",
                 "status_detail": "ENUMERATED (no reachable service)",
                 "positive": False,
                 "mode": "fast",
                 "source": "scan-enum",
-                "description": ("Enumerated %s host (%s). No reachable service was observed "
-                                "during the passive scan, but the hostname indicates critical "
-                                "infrastructure worth tracking." % (infra_cat, h)),
-                "impact": "Critical-infrastructure footprint; verify ownership and exposure.",
-                "evidence": {"host": h, "classification": infra_cat},
+                "description": ("Enumerated host %s. No service answered during the scan; its "
+                                "name suggests %s, which is context, not evidence."
+                                % (h, name_hint.lower())),
+                "impact": "Inventory only; verify ownership if the name is unexpected.",
+                "evidence": {"host": h, "name_hint": name_hint},
                 "proof_chain": ["enumerated via CT/DNS: %s" % h],
                 "remediation": ["Confirm this host is authorized; if it is not meant to be public, decommission or restrict it."],
                 "related_cves": [],
@@ -2500,20 +2722,25 @@ def synthesize_surface_findings(slug, snippets, reached, services=None, enumerat
             else:
                 seen_identities.add(ik_web)
                 seq += 1
-                cat = infra_cat or "Internet-facing service"
-                sev = infra_sev or "INFO"
+                admin = _admin_product(s)
+                cat = "Admin / management console" if admin else "Web service"
+                sev = "LOW" if admin else "INFO"
                 evidence = {k: v for k, v in s.items() if k != "assets"}
                 evidence["port"] = wport
                 if open_ports:
                     evidence["services"] = open_ports   # informational: full port map
                 if banners_all:
                     evidence["banners"] = banners_all
+                if name_hint:
+                    evidence["name_hint"] = name_hint
                 desc = "Host is reachable on the public internet. Fingerprint: %s." % (
                     s.get("title") or s.get("url") or h)
                 if port_list:
                     desc += " Open ports: %s." % port_list
-                if infra_cat:
-                    desc += " Classified: %s." % infra_cat
+                if admin:
+                    desc += " The page identifies itself as %s." % admin
+                if name_hint:
+                    desc += " Hostname suggests %s (not used to classify)." % name_hint.lower()
                 if banners_all:
                     banner_summary = "; ".join(
                         f"{p}/{b[:70]}" for p, b in sorted(banners_all.items(), key=lambda kv: int(kv[0]))[:3]
@@ -2524,24 +2751,28 @@ def synthesize_surface_findings(slug, snippets, reached, services=None, enumerat
                     proof += [f"banner {p}: {b[:100]}" for p, b in sorted(banners_all.items(), key=lambda kv: int(kv[0]))[:5]]
                 rec = {
                     "id": "SRV-%s-%s-%02d" % (_slugify(slug), ts, seq),
-                    "title": ("%s exposure" % infra_cat) if infra_cat else "Reachable service (passively fingerprinted)",
+                    "title": ("%s console reachable" % admin.title()) if admin
+                             else "Reachable web service",
                     "target": h,
                     "ip": ip,
                     "port": wport,
                     "severity": sev,
                     "category": cat,
+                    "classified_by": "service",
+                    "confidence": "high",
+                    "confidence_reason": "HTTP response captured",
                     "status": "OPEN",
                     "status_detail": "SCAN-DETECTED (passive fingerprint)" + (" + service probe" if open_ports else ""),
                     "positive": False,
                     "mode": "fast",
                     "source": "scan-surface",
                     "description": desc,
-                    "impact": ("Critical infrastructure reachable on the public internet."
-                               if infra_cat else "Part of the external attack surface."),
+                    "impact": ("An administration console is reachable from the internet."
+                               if admin else "Part of the external attack surface."),
                     "evidence": evidence,
                     "proof_chain": proof,
-                    "remediation": ["Restrict access to this %s via firewall/ACL; require VPN where possible." % infra_cat.lower()
-                                    if infra_cat else "Review whether this service must be publicly reachable; restrict otherwise."],
+                    "remediation": ["Put the %s console behind a VPN or SSO gateway; never expose it directly." % admin
+                                    if admin else "Review whether this service must be publicly reachable; restrict otherwise."],
                     "related_cves": [],
                     "found_date": time.strftime("%Y-%m-%d"),
                     "first_seen": time.strftime("%Y-%m-%d"),
@@ -2563,7 +2794,7 @@ def synthesize_surface_findings(slug, snippets, reached, services=None, enumerat
                 seen_identities.add(ik_tcp)
                 seq += 1
                 rec2 = _tcp_service_finding(slug, ts, seq, h, ip, int(p_str), name,
-                                            banners_all.get(p_str), infra_cat, infra_sev)
+                                            banners_all.get(p_str), name_hint)
                 rec2["identity_key"] = cc.identity_key(rec2)
                 out.append(rec2)
             continue
@@ -2576,7 +2807,7 @@ def synthesize_surface_findings(slug, snippets, reached, services=None, enumerat
             seen_identities.add(ik_tcp)
             seq += 1
             rec3 = _tcp_service_finding(slug, ts, seq, h, ip, int(p_str), name,
-                                        banners_all.get(p_str), infra_cat, infra_sev)
+                                        banners_all.get(p_str), name_hint)
             rec3["identity_key"] = cc.identity_key(rec3)
             out.append(rec3)
     return out
@@ -2627,7 +2858,6 @@ def _migrate_legacy_surface_findings(fs):
                 ports = sorted(svc_map.keys(), key=lambda x: int(x))
             except Exception:
                 ports = sorted(svc_map.keys())
-            infra_cat, _sev = _classify_infra(str(f.get("target", "")))
             sh = f.get("status_history") if isinstance(f.get("status_history"), list) else []
             for i, p in enumerate(ports):
                 name = str(svc_map.get(p) or "service")
@@ -2652,8 +2882,7 @@ def _migrate_legacy_surface_findings(fs):
                     proof.append("banner %s: %s" % (p, banner[:100]))
                 child["evidence"] = nev
                 child["proof_chain"] = proof
-                child["title"] = ("%s service exposed on TCP %s" % (infra_cat, p)) if infra_cat \
-                    else ("%s (%s TCP %s)" % (str(f.get("title", "Exposed service")).split(" (TCP")[0], name, p))
+                child["title"] = "Exposed %s service (TCP %s)" % (_classify_service(name, p)[0], p)
                 if i > 0:
                     child["description"] = ("Split from combined finding %s: open service %s on TCP %s."
                                             % (old_id, name, p))
@@ -2988,6 +3217,167 @@ def _observed_surface_ids(snippets, services, resolved_hosts):
     return ids, obs_ips
 
 
+_UNCONFIRMED_REASONS = {
+    "no-greeting": "TCP %(port)s accepted the connection but no %(label)s greeting followed; "
+                   "a load balancer or firewall answered, not %(label)s",
+    "blanket": "the host accepts connections on every probed port, including unused canary "
+               "ports, so TCP %(port)s being open proves nothing",
+}
+
+
+def _evidence_dict(f):
+    ev = f.get("evidence")
+    if isinstance(ev, str):
+        try:
+            ev = json.loads(ev)
+        except ValueError:
+            ev = {}
+    return ev if isinstance(ev, dict) else {}
+
+
+def _retire_false_positive(f, reason):
+    _append_history_note(f, "false positive: " + reason, by="accuracy", to="FALSE_POSITIVE")
+    f["status"] = "FALSE_POSITIVE"
+    f["fp_by"] = "scanner"
+    f["fp_reason"] = reason
+    f["confidence"] = "low"
+    f["confidence_reason"] = reason
+
+
+def _strip_hostname_classification(text):
+    return re.sub(r"\s*(?:Classified: [^.]*\.|Host classified as [^.]*\.)", "", str(text or ""))
+
+
+def _reclassify_legacy(f, svc):
+    """Re-derive category/title/severity of a scanner finding from evidence.
+
+    Records written before service-based classification took them from the
+    hostname. Severity set by AI grading is kept; identity, status and
+    history never change. Returns True when the record changed.
+    """
+    src = str(f.get("source") or "")
+    ev = _evidence_dict(f)
+    old = (f.get("title"), f.get("category"), f.get("severity"))
+    keep_sev = "ai_grading" in f
+    hint = _classify_infra(str(f.get("target") or ""))[0]
+    if src == "scan-services":
+        try:
+            p = int(f.get("port") or ev.get("port"))
+        except (TypeError, ValueError):
+            return False
+        name = str(((svc or {}).get("open") or {}).get(str(p))
+                    or (ev.get("services") or {}).get(str(p)) or "unknown")
+        label, cat, sev, fix = _classify_service(name, p)
+        f["title"] = "Exposed %s service (TCP %d)" % (label, p)
+        f["category"], f["remediation"] = cat, [fix]
+        banner = (ev.get("banners") or {}).get(str(p))
+        f["description"] = ("Open service: %s on TCP %d." % (label, p)
+                            + (" Greeting: %s." % str(banner)[:70] if banner else ""))
+    elif src == "scan-surface":
+        admin = _admin_product(ev)
+        cat, sev = ("Admin / management console", "LOW") if admin else ("Web service", "INFO")
+        f["title"] = ("%s console reachable" % admin.title()) if admin else "Reachable web service"
+        f["category"] = cat
+        f["impact"] = ("An administration console is reachable from the internet."
+                       if admin else "Part of the external attack surface.")
+        f["remediation"] = ["Put the %s console behind a VPN or SSO gateway; never expose it directly."
+                            % admin if admin else
+                            "Review whether this service must be publicly reachable; restrict otherwise."]
+        f["description"] = _strip_hostname_classification(f.get("description"))
+    elif src == "scan-enum":
+        cat, sev = "Unreachable host", "INFO"
+        f["title"] = "Unreachable host named like %s" % (hint or "infrastructure").lower()
+        f["category"] = cat
+        f["impact"] = "Inventory only; verify ownership if the name is unexpected."
+        f["confidence"], f["confidence_reason"] = "low", "hostname only; no service answered"
+    elif src == "scan-login":
+        admin = _admin_product(ev) or (
+            "remote access" if _LOGIN_PAGE_PRIVILEGED.search(str(ev.get("title") or "")) else None)
+        sev = "MEDIUM" if admin else "LOW"
+        f["description"] = _strip_hostname_classification(f.get("description"))
+    else:
+        return False
+    if hint:
+        ev["name_hint"] = hint
+        f["evidence"] = ev
+    if not keep_sev:
+        f["severity"] = sev
+    f["classified_by"] = "service"
+    if (f.get("title"), f.get("category"), f.get("severity")) != old:
+        _append_history_note(f, "reclassified from the observed service (was %s, %s)"
+                             % (old[1] or "uncategorized", old[2] or "?"), by="accuracy")
+        return True
+    return False
+
+
+def _apply_accuracy_rules(fs, services):
+    """Correct stored findings with this scan's verified evidence (scan persist).
+
+    - OPEN service / new-port findings on a port the scan could not confirm
+      (silent greet-first service, or a host that answers every port) become
+      FALSE_POSITIVE with the reason,
+    - OPEN AI findings on a host that answers every port become
+      FALSE_POSITIVE: the model judged ports that were never open,
+    - OPEN version findings whose only "version" is a protocol (HTTP/1.1)
+      become FALSE_POSITIVE,
+    - scanner findings classified by hostname are reclassified by service,
+    - service findings get the port's confidence from this scan.
+
+    Analyst-owned statuses are never changed. Returns a counter dict.
+    """
+    counts = {"false_positive": 0, "reclassified": 0}
+    unconfirmed, blanket, by_host = {}, set(), {}
+    for h, svc in (services or {}).items():
+        if not isinstance(svc, dict):
+            continue
+        keys = [str(h).strip().lower()] + ([str(svc["ip"])] if svc.get("ip") else [])
+        for k in keys:
+            by_host.setdefault(k, svc)
+        if svc.get("blanket"):
+            blanket.update(keys)
+        for p, u in (svc.get("unconfirmed") or {}).items():
+            label = _classify_service(u.get("service"), p)[0]
+            reason = _UNCONFIRMED_REASONS.get(u.get("reason"), _UNCONFIRMED_REASONS["blanket"]) \
+                % {"port": p, "label": label}
+            for k in keys:
+                unconfirmed[(k, str(p))] = reason
+    for f in fs:
+        if not isinstance(f, dict):
+            continue
+        status = str(f.get("status") or "OPEN").upper()
+        src = str(f.get("source") or "")
+        target = str(f.get("target") or "").strip().lower()
+        ip = str(f.get("ip") or "")
+        port = str(f.get("port") or _evidence_dict(f).get("port") or "")
+        if status == "OPEN" and not f.get("positive"):
+            reason = None
+            if src in ("scan-services", "baseline-diff") and port:
+                reason = unconfirmed.get((target, port)) or unconfirmed.get((ip, port))
+            elif src == "ai-assess" and (target in blanket or ip in blanket):
+                reason = ("the AI assessment was based on port results from a host that "
+                          "accepts every connection")
+            elif src == "scan-version":
+                vs = _evidence_dict(f).get("versions") or []
+                if vs and all(_is_protocol_version(v) for v in vs if isinstance(v, dict)):
+                    reason = "the disclosed \"version\" is the protocol (e.g. HTTP/1.1), not software"
+            if reason:
+                _retire_false_positive(f, reason)
+                counts["false_positive"] += 1
+                continue
+        if f.get("classified_by") != "service" and src in (
+                "scan-services", "scan-surface", "scan-enum", "scan-login"):
+            if _reclassify_legacy(f, by_host.get(target) or by_host.get(ip)):
+                counts["reclassified"] += 1
+        if src == "scan-services" and port and status != "FALSE_POSITIVE":
+            svc = by_host.get(target) or by_host.get(ip) or {}
+            level = (svc.get("port_confidence") or {}).get(port)
+            if level:
+                f["confidence"] = level
+                f["confidence_reason"] = ("service greeting identified the protocol" if level == "high"
+                                          else "TCP connection accepted; this protocol does not greet first")
+    return counts
+
+
 def _reconcile_findings(fs, snippets, services, resolved_hosts, certs,
                         resolve_after=None):
     """Deterministic observation bookkeeping + tiered resolution (scan persist).
@@ -3040,6 +3430,19 @@ def _reconcile_findings(fs, snippets, services, resolved_hosts, certs,
             observed = tgt in snippet_targets or tgt in obs_ips
 
         status = str(f.get("status", "")).upper()
+        if status == "FALSE_POSITIVE":
+            # an analyst's refutation is final; a scanner retirement reopens
+            # only when a later scan verifies the very same port
+            if observed and fam == "surface-tcp" and f.get("fp_by") == "scanner":
+                _append_history_note(f, "port verified on a later scan; reopened",
+                                     by="reconcile", to="OPEN")
+                f["status"] = "OPEN"
+                f.pop("fp_by", None)
+                f.pop("fp_reason", None)
+                f["missing_streak"] = 0
+                counts["reopened"] += 1
+                counts["observed"] += 1
+            continue
         if status == "RESOLVED":
             if observed:
                 f["status"] = "OPEN"
@@ -3165,8 +3568,10 @@ def _refresh_finding_evidence(fs, snippets, services):
     return refreshed
 
 
-_LOGIN_INFRA_MEDIUM = ("VPN / remote access", "Admin / management", "Cloud / console",
-                       "Code / CI-CD", "Database", "Mail / collaboration")
+# login page titles that mark a privileged portal (VPN / remote access gateways)
+_LOGIN_PAGE_PRIVILEGED = re.compile(
+    r"\b(?:vpn|globalprotect|anyconnect|fortigate|forticlient|pulse secure|citrix|"
+    r"netscaler|remote access|ssl-vpn)\b", re.I)
 
 
 def _existing_target_category_keys(slug):
@@ -3233,16 +3638,23 @@ def synthesize_login_findings(slug, snippets):
         key = (str(h).strip().lower(), "login portal exposed")
         if key in existing_keys:
             continue
-        infra_cat, _ = _classify_infra(h)
-        sev = "MEDIUM" if infra_cat in _LOGIN_INFRA_MEDIUM else "LOW"
+        # severity from what the page serves (an admin/VPN console), not its name
+        admin = _admin_product(s) or (
+            "remote access" if _LOGIN_PAGE_PRIVILEGED.search(str(s.get("title") or "")) else None)
+        sev = "MEDIUM" if admin else "LOW"
+        name_hint = _classify_infra(h)[0]
         seq += 1
         ev = {k: s[k] for k in ("url", "code", "title", "server", "tech") if s.get(k)}
         ev["login_form"] = True
+        if name_hint:
+            ev["name_hint"] = name_hint
         desc = "Public login form observed on %s (HTTP %s)." % (h, code or "?")
         if s.get("title"):
             desc += " Page title: %s." % s.get("title")
-        if infra_cat:
-            desc += " Host classified as %s." % infra_cat
+        if admin:
+            desc += " The page is a %s login." % admin
+        if name_hint:
+            desc += " Hostname suggests %s (not used to classify)." % name_hint.lower()
         out.append({
             "id": "LOGIN-%s-%s-%02d" % (_slugify(slug), ts, seq),
             "title": "Login portal exposed (internet-facing)",
@@ -3289,7 +3701,7 @@ def synthesize_version_findings(slug, snippets):
     seq = 0
     for h in sorted(snippets):
         s = snippets.get(h) or {}
-        versions = s.get("versions") or []
+        versions = [v for v in (s.get("versions") or []) if not _is_protocol_version(v)]
         if not versions:
             continue
         key = (str(h).strip().lower(), "software version disclosure")
@@ -3347,6 +3759,13 @@ _BANNER_VERSION_PATTERNS = (
 )
 _CLEAN_VERSION_RE = re.compile(r"^\d+(?:\.\d+){0,3}[a-z0-9]{0,4}$", re.I)
 
+# "HTTP/1.1" and "SSH-2.0" name the protocol, not the software behind it
+_PROTOCOL_PRODUCTS = {"http", "https", "ssh", "sftp", "rtsp", "sip", "tls", "ssl", "spdy"}
+
+
+def _is_protocol_version(v):
+    return str((v or {}).get("product", "")).strip().lower() in _PROTOCOL_PRODUCTS
+
 
 def _banner_versions(banner):
     """{product, version} pairs from a service banner/greeting line."""
@@ -3359,7 +3778,7 @@ def _banner_versions(banner):
             break  # one product per greeting line
     for v in parse_versions(text):
         # accept the generic extractor only for clean numeric-ish versions
-        if _CLEAN_VERSION_RE.match(str(v.get("version", ""))):
+        if _CLEAN_VERSION_RE.match(str(v.get("version", ""))) and not _is_protocol_version(v):
             out.append(v)
     return out[:4]
 
@@ -3766,7 +4185,7 @@ def recheck_findings(slug, max_probe=25, timeout=3, on_progress=None):
         ip = cc.single_public_ip(f.get("ip"))
         if not ip:
             continue
-        if str(f.get("status", "OPEN")).upper() in ("MITIGATED", "ACCEPTED_RISK"):
+        if str(f.get("status", "OPEN")).upper() in ("MITIGATED", "ACCEPTED_RISK", "FALSE_POSITIVE"):
             continue
         if f.get("positive"):
             continue
@@ -4018,6 +4437,17 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
             _merge_banner_versions(snippets, services)
         except Exception as e:
             _log("debug", f"banner version merge failed: {type(e).__name__}: {e}")
+    # --- service verification: a TCP accept alone is not a service ---
+    verification = {"blanket_hosts": 0, "unconfirmed_ports": 0}
+    if services:
+        try:
+            verification = _verify_services(services, snippets)
+            if verification["unconfirmed_ports"]:
+                _emit(on_progress, "capture",
+                      f"set aside {verification['unconfirmed_ports']} unconfirmed port(s); "
+                      f"{verification['blanket_hosts']} host(s) accept every port")
+        except Exception as e:
+            _log("warn", f"service verification failed for {slug}: {type(e).__name__}: {e}")
     _stage_done("services")
 
     # --- TLS certificate inspection: keyed off TCP reachability of TLS ports,
@@ -4176,6 +4606,18 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
                 for f in existing["findings"]:
                     if isinstance(f, dict):
                         cc.ensure_identity(f)
+            # accuracy: retire artifacts this scan disproved and reclassify
+            # hostname-classified records (before reconciliation, so retired
+            # findings are not also counted missing or auto-resolved)
+            accuracy = {"false_positive": 0, "reclassified": 0}
+            try:
+                accuracy = _apply_accuracy_rules(existing["findings"], services)
+                if accuracy["false_positive"] or accuracy["reclassified"]:
+                    _emit(on_progress, "findings",
+                          f"{accuracy['false_positive']} false positive(s) retired, "
+                          f"{accuracy['reclassified']} finding(s) reclassified by service")
+            except Exception as e:
+                _log("warn", f"accuracy pass failed for {slug}: {type(e).__name__}: {e}")
             # deterministic reconciliation: observation bookkeeping + tiered
             # resolution (identity-based; raw-IP findings join via service IPs)
             recon = {"observed": 0, "missing": 0, "resolved": 0,
@@ -4208,8 +4650,10 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
                 "reachable": len(reached),
                 # per-host evidence snippets (status/server/title), PII-safe
                 "fingerprints": {h: s for h, s in snippets.items()},
-                # per-host open service ports (TCP connect scan), {host: {ip, open: {port: svc}}}
+                # per-host verified service ports, {host: {ip, open: {port: svc},
+                # port_confidence, unconfirmed: {port: {service, reason}}, blanket}}
                 "services": services,
+                "service_verification": verification,
                 # full TLS certificate inventory for every inspected host, so
                 # healthy certs are queryable too (not just the ones that
                 # produced a finding). {host: {port, issuer_cn, not_after, ...}}
@@ -4229,6 +4673,8 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
                     "proposed": recon.get("proposed", 0),
                     "reopened": recon.get("reopened", 0),
                     "resolve_after": RESOLVE_AFTER_MISSES,
+                    "false_positive": accuracy.get("false_positive", 0),
+                    "reclassified": accuracy.get("reclassified", 0),
                 },
                 # per-stage wall-clock seconds (enum/resolve/probe/services/
                 # tls/nvd) + total, for scan-performance visibility

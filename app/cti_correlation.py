@@ -30,10 +30,78 @@ ORG_ROOT = os.path.join(DATA_ROOT, "orgs")
 # RESOLVED: the finding's evidence disappeared from the surface (retired by
 # the reconciliation pass) or a renewed cert / fixed service was observed.
 # It is set ONLY by the deterministic reconciliation logic, never by AI.
-CANONICAL_STATUSES = ("OPEN", "IN_PROGRESS", "MITIGATED", "ACCEPTED_RISK", "RESOLVED")
+# FALSE_POSITIVE: the observation was never real. The scanner's accuracy pass
+# sets it (fp_by="scanner") for artifacts such as a port that only a firewall
+# answered; an analyst sets it (fp_by="analyst") to refute a finding.
+CANONICAL_STATUSES = ("OPEN", "IN_PROGRESS", "MITIGATED", "ACCEPTED_RISK", "RESOLVED",
+                      "FALSE_POSITIVE")
 
 # statuses the analyst owns outright — reconciliation never auto-changes them
 ANALYST_OWNED_STATUSES = ("IN_PROGRESS", "MITIGATED", "ACCEPTED_RISK")
+
+# statuses that are not live exposure: excluded from KPIs, reports and actions
+INACTIVE_STATUSES = ("RESOLVED", "FALSE_POSITIVE")
+
+CONFIDENCE_LEVELS = ("high", "medium", "low")
+
+# (level, reason) by finding source, for findings the scanner did not stamp
+_SOURCE_CONFIDENCE = {
+    "scan-tls": ("high", "certificate captured in a TLS handshake"),
+    "scan-dns": ("high", "answer from public DNS"),
+    "scan-surface": ("high", "HTTP response captured"),
+    "scan-version": ("high", "version string in a response header or service greeting"),
+    "nuclei": ("high", "template matched the live response"),
+    "scan-login": ("medium", "password field detected in the page"),
+    "internetdb": ("medium", "third-party scan data (InternetDB), not observed by this scan"),
+    "openhack": ("medium", "active assessment result; verify before acting"),
+    "script": ("medium", ""),
+    "cve-share": ("low", "inferred: the same CVE was seen on another host"),
+    "ip-co-residency": ("low", "inferred: shares an IP with an affected host"),
+    "scan-enum": ("low", "hostname only; no service answered"),
+    "ai-assess": ("low", "model judgement; confirm before acting"),
+}
+
+
+def finding_confidence(f):
+    """(level, reason): how sure the evidence is that this finding is real.
+
+    The scanner stamps `confidence` where it has direct evidence (a service
+    greeting, a verified port). Everything else is derived from the source,
+    so older records and other engines get a consistent value.
+    """
+    c = str(f.get("confidence") or "").lower()
+    if c in CONFIDENCE_LEVELS:
+        return c, str(f.get("confidence_reason") or "")
+    src = str(f.get("source") or "").lower()
+    prov = f.get("provenance")
+    if src == "scan-cve":
+        pc = str(prov.get("confidence") or "").lower() if isinstance(prov, dict) else ""
+        return (pc if pc in CONFIDENCE_LEVELS else "medium",
+                "version-based match; verify the affected configuration")
+    ev = f.get("evidence")
+    if isinstance(ev, str):
+        try:
+            ev = json.loads(ev)
+        except ValueError:
+            ev = {}
+    ev = ev if isinstance(ev, dict) else {}
+    if src == "scan-services":
+        if ev.get("banners"):
+            return "high", "service greeting identified the protocol"
+        return "medium", "TCP connection accepted; no greeting confirmed the service"
+    if src == "scan-headers":
+        if str(ev.get("code") or "")[:1] in ("2", "3"):
+            return "high", "headers read from a normal page"
+        return "medium", "headers read from an error page, which can differ from the app"
+    if src == "baseline-diff":
+        if str(f.get("identity_key") or "").endswith("|host"):
+            return "high", "host resolved in DNS for the first time"
+        return "medium", "port newly accepted connections"
+    if src in _SOURCE_CONFIDENCE:
+        return _SOURCE_CONFIDENCE[src]
+    if "AI-ASSESSED" in str(f.get("status_detail") or "").upper():
+        return _SOURCE_CONFIDENCE["ai-assess"]
+    return "medium", ""
 
 # Entity grouping is derived only from each registered org's configured domains.
 
@@ -353,6 +421,8 @@ def canonical_status(f):
         return "IN_PROGRESS"
     if "MITIGATED" in u:
         return "MITIGATED"
+    if "FALSE" in u and "POSITIVE" in u:
+        return "FALSE_POSITIVE"
     return "OPEN"
 
 
@@ -723,6 +793,9 @@ def set_finding_status(org, id_, new_status, note=""):
             "at": now, "from": old, "to": new_status, "by": "user", "note": note,
         })
         target["status"] = new_status
+        if new_status == "FALSE_POSITIVE":
+            target["fp_by"] = "analyst"
+            target["fp_reason"] = note or "refuted by an analyst"
         target["last_seen"] = now
         _atomic_write_json(fp, data)
         invalidate_org_cache(slug)
@@ -831,6 +904,7 @@ def normalize_finding(f, org=DEFAULT_ORG, meta_date=None):
     else:
         tier = "OTHER"
     nf["tier"] = tier
+    nf["confidence"], nf["confidence_reason"] = finding_confidence(nf)
 
     nf["cve_links"] = ["https://nvd.nist.gov/vuln/detail/" + c
                        for c in extract_cves(f.get("related_cves"))]
@@ -890,8 +964,7 @@ def normalize_finding_light(f, org=DEFAULT_ORG, meta_date=None):
 
     cves = extract_cves(f.get("related_cves"))
     ip = single_public_ip(f.get("ip"))
-    prov = nf.get("provenance")
-    confidence = prov.get("confidence") if isinstance(prov, dict) else None
+    confidence, confidence_reason = finding_confidence(nf)
     return {
         "id": nf.get("id"),
         "title": _mask_value("title", nf.get("title")),
@@ -902,6 +975,8 @@ def normalize_finding_light(f, org=DEFAULT_ORG, meta_date=None):
         "positive": bool(nf.get("positive")),
         "tier": tier,
         "confidence": confidence,
+        "confidence_reason": _mask_value("confidence_reason", confidence_reason),
+        "fp_reason": _mask_value("fp_reason", nf.get("fp_reason")) if nf.get("fp_reason") else None,
         "target": nf.get("target"),
         "ip": nf.get("ip"),
         "port": nf.get("port"),
@@ -1164,14 +1239,20 @@ def summary_from_data(fs, baseline):
     sev = defaultdict(int)
     live = 0
     resolved = 0
+    false_positive = 0
     for f in (fs or []):
-        if canonical_status(f) == "RESOLVED":
+        st = canonical_status(f)
+        if st == "RESOLVED":
             resolved += 1
+            continue
+        if st == "FALSE_POSITIVE":
+            false_positive += 1
             continue
         live += 1
         sev[str(f.get("severity", "INFO")).upper()] += 1
     bl = baseline if isinstance(baseline, list) else []
     return {"findings_total": live, "resolved_total": resolved,
+            "false_positive_total": false_positive,
             "severity": dict(sev), "baseline": len(bl)}
 
 
