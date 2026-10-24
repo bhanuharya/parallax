@@ -1524,6 +1524,7 @@ def api_org_ip_ranges(slug: str, body: IpRangesBody, req: Request):
 class ScanBody(BaseModel):
     mode: str = "fast"
     ai_profile: str = ""
+    model: str = ""   # AI mode only: one of the profile's models (allowed_models)
 
 
 @app.post("/api/orgs/{slug}/scan")
@@ -1546,6 +1547,15 @@ def api_org_scan(slug: str, body: ScanBody = None, req: Request = None):
         if ai_profile_req not in profiles:
             return JSONResponse({"error": "invalid ai_profile", "allowed": sorted(profiles.keys())}, status_code=400)
     effective_profile = ai_providers.resolve_profile_for_org(slug, override=ai_profile_req or None)
+    # an explicit model must belong to the profile that will run (cheap flash
+    # models such as glm-5.3-flash or deepseek-v4.1-flash for triage)
+    ai_model = str(getattr(body, "model", "") or "").strip() if body and mode == "ai" else ""
+    if ai_model:
+        allowed = ai_providers.allowed_models(effective_profile) if effective_profile else ()
+        if ai_model not in allowed:
+            return JSONResponse({"error": "model not available for this provider",
+                                 "profile": effective_profile, "allowed": list(allowed)},
+                                status_code=400)
     # AI fallback: deterministic scan always queues; AI unavailability is recorded in history, not as 400
     # (preserves cron compatibility: mode=ai without config safely degrades to deterministic)
     if mode == "ai" and effective_profile:
@@ -1566,7 +1576,8 @@ def api_org_scan(slug: str, body: ScanBody = None, req: Request = None):
                    "AI mode requested but no ready profile — falling back to deterministic scan",
                    job_id=jid)
     _log_event("info", "scan", slug,
-               f"scan queued (mode={mode}, ai_profile={effective_profile or 'auto'})",
+               f"scan queued (mode={mode}, ai_profile={effective_profile or 'auto'}"
+               f"{', model=' + ai_model if ai_model else ''})",
                job_id=jid)
 
     def _on_progress(stage, message):
@@ -1575,7 +1586,8 @@ def api_org_scan(slug: str, body: ScanBody = None, req: Request = None):
     def _scan_wrap():
         try:
             result = scanner.generate_org(org, mode=mode, ai_profile=effective_profile or ai_profile_req,
-                                          on_progress=_on_progress)
+                                          on_progress=_on_progress,
+                                          **({"ai_model": ai_model} if ai_model else {}))
             # fatal scan failures (e.g. corrupted findings.json) return an
             # "error" key instead of raising — surface them as failed jobs.
             # Optional AI failure does NOT set this key: a good deterministic
@@ -1592,7 +1604,8 @@ def api_org_scan(slug: str, body: ScanBody = None, req: Request = None):
             _log_event("error", "scan", slug, f"scan failed: {e}", job_id=jid)
 
     _executor.submit(_scan_wrap)
-    return {"queued": True, "slug": slug, "mode": mode, "ai_profile": effective_profile, "job_id": jid}
+    return {"queued": True, "slug": slug, "mode": mode, "ai_profile": effective_profile,
+            "model": ai_model or None, "job_id": jid}
 
 
 @app.post("/api/orgs/{slug}/recheck")

@@ -1708,7 +1708,13 @@ def _expand_ai_classification(item, host_dict, services=None):
     }
 
 
-def ai_assess_finding(host_dict, selected, profile_name=None, services=None, feedback=None):
+def _model_kw(model):
+    """call_ai keyword for an explicit model; empty keeps the profile's own."""
+    return {"model": model} if model else {}
+
+
+def ai_assess_finding(host_dict, selected, profile_name=None, services=None, feedback=None,
+                      model=None):
     """Run the classifier on pre-triaged hosts and return expanded full findings.
 
     Returns (list or None, provenance dict or None). `selected` is the host list
@@ -1721,7 +1727,7 @@ def ai_assess_finding(host_dict, selected, profile_name=None, services=None, fee
         return None, None
     allowed = set(selected)
     try:
-        raw, provenance = ai_providers.call_ai(prompt, profile_name=profile_name)
+        raw, provenance = ai_providers.call_ai(prompt, profile_name=profile_name, **_model_kw(model))
         if not raw:
             return None, provenance
         items = parse_ai_classification(raw, allowed)
@@ -1729,7 +1735,8 @@ def ai_assess_finding(host_dict, selected, profile_name=None, services=None, fee
             # single self-repair retry with a JSON-only nudge
             repair = ("Your previous response was not valid JSON. Read the schema again "
                       "and return ONLY the JSON object, no prose.\n\n") + prompt
-            raw2, provenance2 = ai_providers.call_ai(repair, profile_name=profile_name)
+            raw2, provenance2 = ai_providers.call_ai(repair, profile_name=profile_name,
+                                                     **_model_kw(model))
             if raw2:
                 provenance = provenance2 or provenance
                 items = parse_ai_classification(raw2, allowed)
@@ -1752,7 +1759,8 @@ def ai_assess_finding(host_dict, selected, profile_name=None, services=None, fee
         return None, None
 
 
-def ai_assess_org(slug, host_dict, profile_name=None, on_progress=None, services=None):
+def ai_assess_org(slug, host_dict, profile_name=None, on_progress=None, services=None,
+                  model=None):
     """Run AI triage for an org, merge confirmed findings into findings.json.
 
     Returns "done"|"skipped"|"failed". NEVER raises / NEVER blocks the scan.
@@ -1785,7 +1793,8 @@ def ai_assess_org(slug, host_dict, profile_name=None, on_progress=None, services
         append_history(slug, {"kind": "ai_assess", "mode": "ai", "summary": {},
                               "note": "AI skipped: no interesting hosts after deterministic triage"})
         return "skipped"
-    _emit(on_progress, "ai", f"calling AI provider ({effective or 'default'}) on {len(selected)} triaged hosts")
+    _emit(on_progress, "ai", f"calling AI provider ({effective or 'default'}"
+                              f"{', ' + model if model else ''}) on {len(selected)} triaged hosts")
     # Bound the AI phase: chunked batches (AI_BATCH_SIZE), bounded parallelism
     # (AI_PARALLEL_BATCHES), and a wall-clock budget (AI_PHASE_BUDGET). Batches
     # that would start past the deadline are skipped — deterministic results
@@ -1806,7 +1815,7 @@ def ai_assess_org(slug, host_dict, profile_name=None, on_progress=None, services
                     skipped_batches += 1
                     continue
                 fut_map[ex.submit(ai_assess_finding, ai_hosts, b,
-                                  effective, services, feedback)] = b
+                                  effective, services, feedback, **_model_kw(model))] = b
             for fut in _cf.as_completed(fut_map):
                 try:
                     a, p = fut.result()
@@ -2178,7 +2187,7 @@ def parse_ai_grading(raw, allowed_ids):
     return out if out else None
 
 
-def ai_grade_org(slug, profile_name=None, on_progress=None):
+def ai_grade_org(slug, profile_name=None, on_progress=None, model=None):
     """Grade existing OPEN findings with the configured AI profile (judgment only).
 
     Returns "done"|"skipped"|"failed". NEVER raises / NEVER blocks the scan and
@@ -2200,13 +2209,14 @@ def ai_grade_org(slug, profile_name=None, on_progress=None):
         return "skipped"
     _emit(on_progress, "ai_grade", f"calling AI provider ({effective}) to grade {len(candidates)} findings")
     try:
-        raw, provenance = ai_providers.call_ai(prompt, profile_name=effective)
+        raw, provenance = ai_providers.call_ai(prompt, profile_name=effective, **_model_kw(model))
         grading = parse_ai_grading(raw, {c["id"] for c in candidates}) if raw else None
         if grading is None and raw:
             # single self-repair retry with a JSON-only nudge
             repair = ("Your previous response was not valid JSON. Read the schema again "
                       "and return ONLY the JSON object, no prose.\n\n") + prompt
-            raw2, provenance2 = ai_providers.call_ai(repair, profile_name=effective)
+            raw2, provenance2 = ai_providers.call_ai(repair, profile_name=effective,
+                                                     **_model_kw(model))
             if raw2:
                 provenance = provenance2 or provenance
                 grading = parse_ai_grading(raw2, {c["id"] for c in candidates})
@@ -3840,12 +3850,14 @@ def recheck_findings(slug, max_probe=25, timeout=3, on_progress=None):
     return changed
 
 
-def generate_org(org, mode="fast", ai_profile=None, on_progress=None):
+def generate_org(org, mode="fast", ai_profile=None, on_progress=None, ai_model=None):
     """Scan a registered org and (re)write its baseline.txt + findings.json.
 
     mode: "fast" (deterministic only) or "ai" (after deterministic persist,
     also run an optional AI-assisted assessment). ai_profile optionally
-    overrides the org's configured profile. Returns a small stats dict.
+    overrides the org's configured profile and ai_model the profile's model
+    (callers validate it against ai_providers.allowed_models). Returns a
+    small stats dict.
     Raises ValueError for an invalid slug.
     """
     slug = str(org.get("slug") or "").strip()
@@ -3866,13 +3878,14 @@ def generate_org(org, mode="fast", ai_profile=None, on_progress=None):
 
     try:
         return _generate_org_inner(org, slug, domains, org_dir, mode,
-                                   ai_profile, on_progress)
+                                   ai_profile, on_progress, ai_model)
     finally:
         with _RUNNING_LOCK:
             _RUNNING[slug] = False
 
 
-def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progress):
+def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progress,
+                        ai_model=None):
     """Body of generate_org (split so the _RUNNING flag wraps everything)."""
     # per-stage wall-clock stats (seconds) surfaced in meta.scan_stats
     _scan_t0 = time.monotonic()
@@ -4300,7 +4313,8 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
             # explicit ai_profile override takes precedence, else org config / default
             _emit(on_progress, "ai", "starting AI assessment")
             effective = ai_profile or ai_providers.resolve_profile_for_org(slug)
-            ai = ai_assess_org(slug, snippets, profile_name=effective, on_progress=on_progress, services=services)
+            ai = ai_assess_org(slug, snippets, profile_name=effective, on_progress=on_progress,
+                               services=services, model=ai_model)
             _emit(on_progress, "ai", f"AI assessment result: {ai}")
             # include AI findings in snapshot so next scan doesn't report them as new
             if ai == "done":
@@ -4319,7 +4333,8 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
             # Stage B: judgment-only grading of existing deterministic findings
             # (re-severity/impact by finding ID; never blocks or mutates on failure)
             try:
-                grade = ai_grade_org(slug, profile_name=effective, on_progress=on_progress)
+                grade = ai_grade_org(slug, profile_name=effective, on_progress=on_progress,
+                                     model=ai_model)
                 _emit(on_progress, "ai_grade", f"AI grading result: {grade}")
             except Exception:
                 grade = "failed"
@@ -4328,6 +4343,7 @@ def _generate_org_inner(org, slug, domains, org_dir, mode, ai_profile, on_progre
 
     return {"slug": slug, "mode": mode, "ai": ai,
             "ai_profile": ai_providers.resolve_profile_for_org(slug, override=ai_profile) if mode == "ai" else None,
+            "ai_model": ai_model if mode == "ai" else None,
             "subdomains": len(hosts), "resolved": len(baseline),
             "reachable": len(reached), "new_exposure": new_exposure}
 
