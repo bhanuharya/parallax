@@ -208,6 +208,9 @@
   .badge.status-inprogress { --dotc:var(--warning); }
   .badge.status-mitigated { --dotc:var(--good); }
   .badge.status-accepted { --dotc:var(--muted); }
+  .badge.status-resolved { --dotc:var(--good); }
+  .badge.status-fp { --dotc:var(--muted); }
+  .fsum.fpnote { -webkit-line-clamp:unset; font-style:italic; }
   .tag { font-size:11.5px; color:var(--text-2); }
   .tag.statdetail { white-space:normal; }
   .tag.confirmed, .tag.clean, .tag.conf-high, .pill.positive { color:var(--good-ink); }
@@ -825,7 +828,7 @@
               <label for="statussel">Status</label>
               <select id="statussel" class="sortsel">
                 <option value="all" selected>All</option><option value="OPEN">Open</option><option value="IN_PROGRESS">In progress</option>
-                <option value="MITIGATED">Mitigated</option><option value="ACCEPTED_RISK">Accepted risk</option><option value="RESOLVED">Resolved</option>
+                <option value="MITIGATED">Mitigated</option><option value="ACCEPTED_RISK">Accepted risk</option><option value="RESOLVED">Resolved</option><option value="FALSE_POSITIVE">False positive</option>
               </select>
               <button class="btn small" id="findings-collapseall" type="button">Expand all</button>
               <button class="btn small" id="findings-refresh" type="button">Refresh</button>
@@ -1137,7 +1140,8 @@ const confidenceTag = (f) => {
   const c = String((f && f.confidence) || '').toLowerCase();
   if (c !== 'low' && c !== 'medium' && c !== 'high') return '';
   const cls = c === 'low' ? 'conf-low' : (c === 'medium' ? 'conf-medium' : 'conf-high');
-  return `<span class="tag ${cls}" title="Evidence confidence of this finding (version-match granularity)">${esc(c.toUpperCase())} CONF</span>`;
+  const why = (f && f.confidence_reason) || 'How sure the evidence is that this finding is real';
+  return `<span class="tag ${cls}" title="${esc(why)}">${esc(c.toUpperCase())} CONF</span>`;
 };
 
 const statusInfo = (s) => {
@@ -1145,6 +1149,8 @@ const statusInfo = (s) => {
   if (v === 'IN_PROGRESS') return { cls: 'status-inprogress', label: 'IN PROGRESS' };
   if (v === 'MITIGATED') return { cls: 'status-mitigated', label: 'MITIGATED' };
   if (v === 'ACCEPTED_RISK') return { cls: 'status-accepted', label: 'ACCEPTED RISK' };
+  if (v === 'RESOLVED') return { cls: 'status-resolved', label: 'RESOLVED' };
+  if (v === 'FALSE_POSITIVE') return { cls: 'status-fp', label: 'FALSE POSITIVE' };
   return { cls: 'status-open', label: 'OPEN' };
 };
 
@@ -3907,7 +3913,7 @@ function renderFindings(d) {
   findingList = applyTierFilter(lastFindingsRaw);
   findingPage = 1;
   $('fcount').textContent = findingList.length;
-  const open = lastFindingsRaw.filter((f) => !['RESOLVED', 'MITIGATED', 'ACCEPTED_RISK']
+  const open = lastFindingsRaw.filter((f) => !['RESOLVED', 'MITIGATED', 'ACCEPTED_RISK', 'FALSE_POSITIVE']
     .includes(String(f.status || 'OPEN').toUpperCase())).length;
   $('nav-findings').textContent = open || '';
   renderFindingPage();
@@ -4011,6 +4017,7 @@ function findingCard(f) {
     '</div>' +
     (sub.length ? '<div class="fsub">' + sub.join('') + '</div>' : '') +
     (f.summary ? '<p class="fsum">' + esc(f.summary) + '</p>' : '') +
+    (statusIs(f.status, 'FALSE_POSITIVE') && f.fp_reason ? '<p class="fsum fpnote">False positive: ' + esc(f.fp_reason) + '</p>' : '') +
     '<div class="fbody">' +
       cveHtml +
       (meta.length ? '<div class="fmeta">' + meta.join('') + '</div>' : '') +
@@ -4076,6 +4083,7 @@ const statusEditorHtml = (f) => {
       sel('IN_PROGRESS', 'In progress') +
       sel('MITIGATED', 'Mitigated') +
       sel('ACCEPTED_RISK', 'Accepted risk') +
+      sel('FALSE_POSITIVE', 'False positive') +
     '</select>' +
     '<input id="stedit-note" class="stinput" type="text" placeholder="note (optional)" autocomplete="off">' +
     '<button class="btn primary" id="stedit-save" type="button">Update</button>' +
@@ -4215,6 +4223,8 @@ function renderModal(f) {
   }
   if (f.found_date) rows.push(drow('Found', `<span class="mono">${esc(f.found_date)}</span>`));
   rows.push(drow('Status', statusSectionHtml(f)));
+  if (f.confidence) rows.push(drow('Confidence', esc(String(f.confidence).toUpperCase()) + (f.confidence_reason ? ' · ' + esc(f.confidence_reason) : '')));
+  if (f.fp_reason) rows.push(drow('False positive', esc(f.fp_reason)));
   if (f.first_seen) rows.push(drow('First seen', `<span class="mono">${esc(f.first_seen)}</span>`));
   if (f.last_seen) rows.push(drow('Last seen', `<span class="mono">${esc(f.last_seen)}</span>`));
   const hist = statusHistoryHtml(f);

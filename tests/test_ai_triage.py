@@ -158,7 +158,10 @@ def test_surface_finds_enumerated_critical_infra(tmp_path, monkeypatch):
     assert "www.acme.example" in targets
     assert "random.acme.example" not in targets  # unknown + unreachable -> skipped
     vpn = next(r for r in out if r["target"] == "vpn.acme.example")
-    assert vpn["severity"] == "MEDIUM"
+    # the name is the only evidence: inventory context, never a severity
+    assert vpn["severity"] == "INFO" and vpn["confidence"] == "low"
+    assert vpn["category"] == "Unreachable host"
+    assert vpn["evidence"]["name_hint"] == "VPN / remote access"
     assert vpn["status_detail"] == "ENUMERATED (no reachable service)"
 
 

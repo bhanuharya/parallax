@@ -1,5 +1,41 @@
 # Handoff — Asset Inventory & Scorecard Cycle
 
+## Accuracy: verified ports, service classification, confidence (2026-10-25)
+
+- **What "open" means now:** `scanner._verify_services` runs after the banner
+  grab. A port is *confirmed* when its greeting identifies the protocol
+  (`_identify_protocol`), *plausible* when it accepts silently on a protocol
+  that does not greet first, and *unconfirmed* when a greet-first protocol
+  (FTP, SSH, POP3, IMAP, MySQL, VNC) stays silent. A host with at least
+  `CTI_BLANKET_CANARY_MIN` (4) plausible ports gets three canary connects to
+  unused high ports; if two or more accept, it is a "blanket" host and its
+  plausible ports become unconfirmed. `meta.services[h].open` keeps confirmed
+  and plausible ports only, so ratings and findings ignore the artifacts;
+  `unconfirmed`, `port_confidence` and `blanket` record the rest.
+- **Why:** on a real org, port 21 was "open" on 416 hosts but greeted on 2,
+  and one host answered all 22 probed ports. That produced hundreds of
+  service findings, "Database service exposed on TCP 21" titles, and an AI
+  finding judging ports that were never open.
+- **Classification:** `_classify_service` maps the observed service to
+  category, title, severity and fix (severities match the rating model's
+  high-risk ports). The hostname keyword table (`_classify_infra`) is now a
+  hint stored as `evidence.name_hint`; it sets nothing. Web findings use the
+  page itself (`_admin_product`); login severity uses the page title.
+- **Stored findings:** `_apply_accuracy_rules` (before reconciliation) marks
+  OPEN findings on unconfirmed ports, AI findings on blanket hosts, and
+  protocol-only "versions" (HTTP/1.1) as `FALSE_POSITIVE` (`fp_by: scanner`,
+  `fp_reason`), and reclassifies hostname-classified records once
+  (`classified_by: service`; AI-graded severity kept). A scanner false
+  positive reopens if a later scan verifies the same port; an analyst's
+  (`fp_by: analyst`, settable in the status editor) is final.
+- **Confidence:** `cc.finding_confidence(f)` gives every finding a level and
+  reason (stamped by the scanner where it has direct evidence, else by
+  source). It is on the list projection, the detail view and the card tag.
+- `posture.MODEL_VERSION = 5`: trends do not compare across the change.
+- Dry run on the real org's stored data: verified ports 657 → 238, 543
+  findings retired (438 service, 105 version), open findings 944 → 401. The
+  one 21-port host needs the live canary check, so rescan to finish.
+
 ## Public data and docs (2026-10-23, late)
 
 - **Real data removed from the public repo:** `data/orgs.json` on `main` had

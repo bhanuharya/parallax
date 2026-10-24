@@ -161,7 +161,9 @@ def _patch_network(monkeypatch, tmp_path, subs, resolve_map, open_by_ip, probed)
         probed.add(ip)
         return "reachable" if str(port) in open_by_ip.get(ip, ()) else "closed"
     monkeypatch.setattr(scanner, "_tcp_reachable", tcp)
-    monkeypatch.setattr(scanner, "_grab_banner", lambda *a, **k: None)
+    # SSH greets first, so an open 22 needs its greeting to count
+    monkeypatch.setattr(scanner, "_grab_banner",
+                        lambda ip, port, *a, **k: "SSH-2.0-OpenSSH_9.6" if int(port) == 22 else None)
     monkeypatch.setattr(scanner, "_tls_cert", lambda *a, **k: None)
     monkeypatch.setattr(scanner, "_wildcard_cache", {})
     monkeypatch.setattr(cc, "org_findings_path",

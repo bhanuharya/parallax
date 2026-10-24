@@ -79,12 +79,15 @@ def test_login_finding_created_for_password_form(tmp_path, monkeypatch):
     assert f["evidence"]["login_form"] is True
 
 
-def test_login_finding_severity_raised_for_infra_host(tmp_path, monkeypatch):
+def test_login_finding_severity_comes_from_the_page_not_the_hostname(tmp_path, monkeypatch):
     _patch_org_path(tmp_path, monkeypatch)
     snippets = {"vpn.example.com": {"url": "https://vpn.example.com",
-                                    "code": "200", "login_form": True}}
-    out = scanner.synthesize_login_findings("sample", snippets)
-    assert out and out[0]["severity"] == "MEDIUM"
+                                    "code": "200", "login_form": True, "title": "Sign in"},
+                "portal.example.com": {"url": "https://portal.example.com", "code": "200",
+                                       "login_form": True, "title": "GlobalProtect Portal"}}
+    out = {f["target"]: f for f in scanner.synthesize_login_findings("sample", snippets)}
+    assert out["vpn.example.com"]["severity"] == "LOW"          # name alone proves nothing
+    assert out["portal.example.com"]["severity"] == "MEDIUM"    # the page is a VPN gateway
 
 
 def test_login_finding_deduped_across_scans(tmp_path, monkeypatch):

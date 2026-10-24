@@ -107,7 +107,14 @@ The [Screens](#screens) section shows each view with demo data.
   exact target allowlist, and time-bounded ROE.
 - **Passive service discovery** — for each resolved host/IP the scanner performs a
   TCP connect scan of common service ports (ssh, rdp, mysql, …), surfacing exposed
-  services without payloads or banner grabbing.
+  services without payloads.
+- **Verified ports, not just accepted connections** — a port counts as open
+  only when its greeting identifies the protocol, or when it accepts silently on
+  a protocol that does not greet first. A silent FTP/SSH/MySQL port is a load
+  balancer answering, and a host that also accepts unused canary ports answers
+  everything; both are set aside, and findings built on them become
+  `FALSE_POSITIVE` with the reason. Services are classified by what answered,
+  never by the hostname, and every finding carries a confidence level and reason.
 - **Six passive enumeration sources** — certificate transparency (crt.name /
   crt.sh / certspotter) plus hackertarget, **Wayback Machine CDX** and
   **AlienVault OTX passive DNS**, so hosts that never had a TLS certificate are

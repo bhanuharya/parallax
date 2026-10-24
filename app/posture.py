@@ -8,7 +8,10 @@ from scorecard import ISSUE_TYPES, hosts_for_domain, _web_responses
 # 4: hosts with a captured TLS certificate are no longer "served without
 # HTTPS", and the client-side ssh-agent CVE-2023-38408 is withdrawn from
 # server-banner matching (it produced false critical caps).
-MODEL_VERSION = 4
+# 5: open ports count only when verified (a greeting, or a silent accept on a
+# protocol that does not greet first, on a host that does not answer every
+# port); load-balancer and firewall artifacts no longer deduct.
+MODEL_VERSION = 5
 
 _GUIDANCE = {
     "vulnerability": ("Verify and patch", "Verify the installed version and affected CVEs; upgrade to a supported, fixed release, then rescan."),

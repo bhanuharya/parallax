@@ -2137,11 +2137,11 @@ def _build_report_html(slug, org, fs, domains, detail_max=_REPORT_DETAIL_MAX):
     # use normalized (PII-masked) findings for report
     meta_date = cc.load_meta_date(slug)
     nfs = [cc.normalize_finding(f, slug, meta_date=meta_date) for f in fs]
-    # resolved findings are lifecycle-noise in a point-in-time report: count
-    # them, but keep sections focused on live items
-    resolved_n = sum(1 for f in nfs
-                     if str(f.get("status", "")).upper() == "RESOLVED")
-    fs = [f for f in nfs if str(f.get("status", "")).upper() != "RESOLVED"]
+    # resolved and false-positive findings are not live exposure in a
+    # point-in-time report: count them, but keep sections on live items
+    inactive = {s: sum(1 for f in nfs if str(f.get("status", "")).upper() == s)
+                for s in cc.INACTIVE_STATUSES}
+    fs = [f for f in nfs if str(f.get("status", "")).upper() not in cc.INACTIVE_STATUSES]
     sev = {}
     for f in fs:
         s = str(f.get("severity", "INFO")).upper()
@@ -2149,9 +2149,10 @@ def _build_report_html(slug, org, fs, domains, detail_max=_REPORT_DETAIL_MAX):
     sev_rows = "".join(
         f"<tr><td>{_esc(k)}</td><td>{_esc(v)}</td></tr>"
         for k, v in sorted(sev.items(), key=lambda kv: _SEV_ORDER.get(kv[0], 99)))
-    if resolved_n:
-        sev_rows += (f"<tr><td>RESOLVED (excluded from sections)</td>"
-                     f"<td>{resolved_n}</td></tr>")
+    for s, n in inactive.items():
+        if n:
+            sev_rows += (f"<tr><td>{_esc(s.replace('_', ' '))} (excluded from sections)</td>"
+                         f"<td>{n}</td></tr>")
 
     posture_html = _report_posture_html(cc.scorecard(slug))
     # large orgs: summarize, and give full detail only to critical/high findings
