@@ -2029,7 +2029,108 @@ def _report_posture_html(data):
             + "<h2>Assessment detail</h2>" + "".join(details) + "</section>")
 
 
-def _build_report_html(slug, org, fs, domains):
+_REPORT_DETAIL_MAX = 100   # above this many live findings, detail only critical/high
+_ACTIVE_STATUSES = ("OPEN", "IN_PROGRESS")
+
+
+def _first_remediation(f):
+    """First remediation step as one clean line (AI findings store a JSON-quoted string)."""
+    r = f.get("remediation")
+    if isinstance(r, list):
+        r = next((x for x in r if str(x).strip()), "")
+    s = " ".join(str(r or "").split())
+    if s.startswith('"'):
+        s = s[1:].removesuffix('"')
+    return s[:240]
+
+
+def _report_action_items(fs, limit=10):
+    """Open findings grouped by their fix, most severe and widest first.
+
+    One row per first remediation step (digits ignored, so per-port and
+    per-version wording groups together): the action, its worst severity,
+    how many findings and hosts it clears, the categories it spans and
+    example hosts.
+    """
+    groups = {}
+    for f in fs:
+        if str(f.get("status") or "OPEN").upper() not in _ACTIVE_STATUSES:
+            continue
+        fix = _first_remediation(f) or "Review and remediate: " + str(f.get("title") or "finding")
+        g = groups.setdefault(re.sub(r"\d+", "#", fix.lower()),
+                              {"fix": fix, "sev": 99, "severity": "INFO", "count": 0,
+                               "hosts": [], "titles": {}, "categories": {}})
+        rank = _SEV_ORDER.get(str(f.get("severity") or "INFO").upper(), 99)
+        if rank < g["sev"]:
+            g["sev"], g["severity"] = rank, str(f.get("severity") or "INFO").upper()
+        g["count"] += 1
+        t = str(f.get("target") or "").strip()
+        if t and t not in g["hosts"]:
+            g["hosts"].append(t)
+        title = str(f.get("title") or "")
+        g["titles"][title] = g["titles"].get(title, 0) + 1
+        cat = str(f.get("category") or "other")
+        g["categories"][cat] = g["categories"].get(cat, 0) + 1
+    ranked = sorted(groups.values(), key=lambda g: (g["sev"], -len(g["hosts"]), -g["count"], g["fix"]))
+    return ranked[:limit], len(groups)
+
+
+def _report_summary_html(fs, detailed, total_live):
+    """Action items, most-affected hosts and categories for the live findings."""
+    items, n_groups = _report_action_items(fs)
+    rows = []
+    for i, g in enumerate(items, 1):
+        example = max(g["titles"], key=g["titles"].get) if g["titles"] else ""
+        cats = sorted(g["categories"], key=lambda c: (-g["categories"][c], c))
+        cat_s = ", ".join(cats[:3]) + (f" +{len(cats) - 3} more" if len(cats) > 3 else "")
+        hosts = ", ".join(_esc(h) for h in g["hosts"][:5])
+        more = len(g["hosts"]) - 5
+        rows.append(f"<tr><td class='n'>{i}</td><td class='n'>{_esc(g['severity'])}</td>"
+                    f"<td><strong>{_esc(g['fix'])}</strong><br><span class='na'>{_esc(cat_s)}"
+                    f"{' · e.g. ' + _esc(example) if example else ''}</span></td>"
+                    f"<td class='n'>{_esc(g['count'])}</td>"
+                    f"<td>{hosts}{f' +{more} more' if more > 0 else ''}</td></tr>")
+    by_host, by_cat = {}, {}
+    for f in fs:
+        if str(f.get("status") or "OPEN").upper() not in _ACTIVE_STATUSES:
+            continue
+        sev = str(f.get("severity") or "INFO").upper()
+        h = by_host.setdefault(str(f.get("target") or "—"), {})
+        h[sev] = h.get(sev, 0) + 1
+        c = by_cat.setdefault(str(f.get("category") or "other"), {})
+        c[sev] = c.get(sev, 0) + 1
+
+    def _sev_mix(counts):
+        return ", ".join(f"{v} {k.lower()}" for k, v in
+                         sorted(counts.items(), key=lambda kv: _SEV_ORDER.get(kv[0], 99)))
+
+    def _rank(counts):
+        return tuple(-counts.get(s, 0) for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"))
+
+    host_rows = "".join(
+        f"<tr><td>{_esc(h)}</td><td>{sum(c.values())}</td><td>{_esc(_sev_mix(c))}</td></tr>"
+        for h, c in sorted(by_host.items(), key=lambda kv: (_rank(kv[1]), kv[0]))[:10])
+    cat_rows = "".join(
+        f"<tr><td>{_esc(k)}</td><td>{sum(c.values())}</td><td>{_esc(_sev_mix(c))}</td></tr>"
+        for k, c in sorted(by_cat.items(), key=lambda kv: (_rank(kv[1]), kv[0]))[:15])
+    note = (f"<p>{_esc(total_live)} live findings: detailed below are the {_esc(detailed)} "
+            "critical and high ones; the rest are covered by these summaries. "
+            "Every finding stays available in the dashboard.</p>"
+            if detailed < total_live else "")
+    return ("<section class='finding'><h2>Top 10 action items</h2>"
+            "<p>Open findings grouped by the fix that clears them, most severe and widest first. "
+            f"Showing {len(items)} of {n_groups} distinct actions.</p>" + note
+            + ("<table class='summary'><tr><th class='n'>#</th><th class='n'>Severity</th><th>Action</th>"
+               "<th class='n'>Findings</th><th>Hosts</th></tr>"
+               + "".join(rows) + "</table>" if rows else "<p>No open findings.</p>")
+            + ("<h2>Most affected hosts</h2><table class='summary'><tr><th>Host</th><th class='n'>Open findings</th>"
+               "<th>Severity mix</th></tr>" + host_rows + "</table>" if host_rows else "")
+            + ("<h2>Findings by category</h2><table class='summary'><tr><th>Category</th><th class='n'>Open findings</th>"
+               "<th>Severity mix</th></tr>" + cat_rows + "</table>" if cat_rows else "")
+            + "</section>")
+
+
+def _build_report_html(slug, org, fs, domains, detail_max=_REPORT_DETAIL_MAX):
     name = _esc(org.get("name") or slug)
     domains_s = ", ".join(_esc(d) for d in domains) or "&mdash;"
     date_s = _esc(time.strftime("%Y-%m-%d"))
@@ -2053,8 +2154,14 @@ def _build_report_html(slug, org, fs, domains):
                      f"<td>{resolved_n}</td></tr>")
 
     posture_html = _report_posture_html(cc.scorecard(slug))
+    # large orgs: summarize, and give full detail only to critical/high findings
+    detail = sorted(fs, key=lambda f: _SEV_ORDER.get(str(f.get("severity", "INFO")).upper(), 99))
+    if len(fs) > detail_max:
+        detail = [f for f in detail
+                  if str(f.get("severity", "")).upper() in ("CRITICAL", "HIGH")][:detail_max]
+    summary_html = _report_summary_html(fs, len(detail), len(fs))
     sections = []
-    for i, f in enumerate(fs, 1):
+    for i, f in enumerate(detail, 1):
         fields = []
         for key in ("id", "title", "severity", "cvss_estimate", "cvss_vector",
                     "target", "ip", "category", "status", "description", "impact",
@@ -2089,6 +2196,9 @@ def _build_report_html(slug, org, fs, domains):
  @media print {{ body {{ -webkit-print-color-adjust: exact; }} }}
  pre {{ white-space: pre-wrap; font-size: 12px; margin: 0; }}
  .na {{ color: #999; }}
+ table.summary th {{ width: auto; }}
+ table.summary .n {{ width: 1%; white-space: nowrap; }}
+ table.summary td:not(.n) {{ word-break: normal; overflow-wrap: anywhere; }}
 </style></head>
 <body>
 <div class='cover'>
@@ -2104,26 +2214,28 @@ def _build_report_html(slug, org, fs, domains):
     <tr><th>Total findings</th><th>{_esc(len(fs))}</th></tr>
   </table>
 </section>
+{summary_html}
+{"<section class='finding'><h2>Finding detail</h2></section>" if sections else ""}
 {''.join(sections)}
 </body></html>"""
 
 
 _PDF_SEMAPHORE = threading.Semaphore(1)  # limit concurrent Chromium processes
-_MAX_PDF_FINDINGS = 500
 _MAX_PDF_HTML_SIZE = 5 * 1024 * 1024  # 5 MiB
 _PDF_TIMEOUT = 45  # seconds
 
 
 def _prepare_report(slug, req):
+    """Report HTML for an org of any size: large ones are summarized, not refused."""
     err, org = _require_org(slug, req)
     if err:
         return None, err
     fs, _ = cc.load_data(slug)
-    if len(fs) > _MAX_PDF_FINDINGS:
-        return None, JSONResponse({"error": "too many findings for report", "max": _MAX_PDF_FINDINGS,
-                             "count": len(fs)}, status_code=413)
     domains = org.get("domains") or []
     report_html = _build_report_html(slug, org, fs, domains)
+    if len(report_html) > _MAX_PDF_HTML_SIZE:
+        # oversized evidence: drop per-finding detail, keep the summaries
+        report_html = _build_report_html(slug, org, fs, domains, detail_max=0)
     if len(report_html) > _MAX_PDF_HTML_SIZE:
         return None, JSONResponse({"error": "report too large", "max": _MAX_PDF_HTML_SIZE}, status_code=413)
     return report_html, None
