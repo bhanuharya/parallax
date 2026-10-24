@@ -1436,6 +1436,8 @@ def get_profiles_for_edit() -> dict:
             "name": pname,
             "provider": p["provider"],
             "model": p["model"],
+            # same list as get_capabilities: the scan card reads this view first
+            "models": list(allowed_models(pname)),
             "base_url": p.get("base_url", ""),
             "api_key_env": p.get("api_key_env"),
             "timeout": p.get("timeout", 90),

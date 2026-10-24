@@ -1016,7 +1016,7 @@
             <div class="formgrid">
               <div class="field"><label for="scanmode">Mode</label><select id="scanmode"><option value="fast" selected>Fast (deterministic)</option><option value="ai">AI-assisted triage</option></select></div>
               <div class="field"><label for="aiprofile">AI profile</label><select id="aiprofile"><option value="">Automatic (default)</option></select><small id="aihint">loading…</small></div>
-              <div class="field"><label for="aiscanmodel">AI model</label><select id="aiscanmodel"><option value="">Profile default</option></select><small>Flash models (glm-5.3-flash, deepseek-v4.1-flash) are faster and cheaper for triage.</small></div>
+              <div class="field"><label for="aiscanmodel">AI model</label><select id="aiscanmodel"><option value="">Profile default</option></select><small id="aiscanmodelhint">Flash models (glm-5.3-flash, deepseek-v4.1-flash) are faster and cheaper for triage.</small></div>
             </div>
             <div class="btngroup" style="margin-top:16px">
               <button class="btn primary" id="ws-scan" type="button" title="Enumeration, DNS, fingerprints, ports, TLS">Run full scan</button>
@@ -1791,11 +1791,20 @@ function syncScanModels() {
   const prof = aiProfiles.find(p => p.name === chosen);
   const models = (prof && prof.models) || [];
   const sel = $('aiscanmodel');
+  const keep = sel.dataset.profile === (prof && prof.name) ? sel.value : '';
+  sel.dataset.profile = (prof && prof.name) || '';
   sel.innerHTML = '<option value="">Profile default' + (prof ? ' (' + esc(prof.model) + ')' : '') + '</option>' +
     models.filter(m => !prof || m !== prof.model).map(m => '<option value="' + esc(m) + '">' + esc(m) + '</option>').join('');
+  // keep the current pick across rebuilds (works even when browser storage
+  // is blocked), else the one remembered for this profile
   const saved = prof && lsGet('ctiScanModel:' + prof.name);
-  sel.value = saved && models.includes(saved) ? saved : '';
-  sel.disabled = $('scanmode').value !== 'ai' || models.length < 2;
+  sel.value = keep && models.includes(keep) ? keep : (saved && models.includes(saved) ? saved : '');
+  // always selectable; it only takes effect on AI-assisted scans
+  sel.disabled = models.length < 2;
+  const hint = $('aiscanmodelhint');
+  if ($('scanmode').value !== 'ai') hint.textContent = 'Used when Mode is AI-assisted triage.';
+  else if (models.length < 2) hint.textContent = 'This profile has a single model.';
+  else hint.textContent = 'Flash models (glm-5.3-flash, deepseek-v4.1-flash) are faster and cheaper for triage.';
 }
 function updateAiHint() {
   syncScanModels();

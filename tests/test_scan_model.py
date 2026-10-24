@@ -46,8 +46,11 @@ def _wait(client, jid):
     raise AssertionError("scan job did not finish")
 
 
-def test_flash_models_are_offered_for_the_profile(opencode_go):
-    caps = opencode_go.get("/api/ai/capabilities", headers=AUTH).json()
+@pytest.mark.parametrize("url", ["/api/ai/profiles", "/api/ai/capabilities"])
+def test_flash_models_are_offered_for_the_profile(opencode_go, url):
+    # the scan card loads /api/ai/profiles first and only falls back to
+    # capabilities, so both views must carry the model list
+    caps = opencode_go.get(url, headers=AUTH).json()
     prof = next(p for p in caps["profiles"] if p["name"] == "opencode-go")
     assert {"glm-5.3-flash", "deepseek-v4.1-flash"} <= set(prof["models"])
 
