@@ -1016,6 +1016,7 @@
             <div class="formgrid">
               <div class="field"><label for="scanmode">Mode</label><select id="scanmode"><option value="fast" selected>Fast (deterministic)</option><option value="ai">AI-assisted triage</option></select></div>
               <div class="field"><label for="aiprofile">AI profile</label><select id="aiprofile"><option value="">Automatic (default)</option></select><small id="aihint">loading…</small></div>
+              <div class="field"><label for="aiscanmodel">AI model</label><select id="aiscanmodel"><option value="">Profile default</option></select><small>Flash models (glm-5.3-flash, deepseek-v4.1-flash) are faster and cheaper for triage.</small></div>
             </div>
             <div class="btngroup" style="margin-top:16px">
               <button class="btn primary" id="ws-scan" type="button" title="Enumeration, DNS, fingerprints, ports, TLS">Run full scan</button>
@@ -1621,6 +1622,10 @@ function init() {
   $('login-btn').addEventListener('click', doLogin);
   $('logout-btn').addEventListener('click', doLogout);
   $('scanmode').addEventListener('change', updateAiHint);
+  $('aiscanmodel').addEventListener('change', () => {
+    const chosen = $('aiprofile').value || aiDefault;
+    if (chosen) lsSet('ctiScanModel:' + chosen, $('aiscanmodel').value);
+  });
   $('md-save').addEventListener('click', saveModelForm);
   $('md-test').addEventListener('click', testModelForm);
   $('md-default').addEventListener('click', defaultModelForm);
@@ -1780,7 +1785,20 @@ function aiDisabledReason() {
   if (reasons.length) return reasons[0];
   return 'No ready AI profile (missing key?)';
 }
+function syncScanModels() {
+  // models the chosen profile allows; remembered per profile in this browser
+  const chosen = $('aiprofile').value || aiDefault;
+  const prof = aiProfiles.find(p => p.name === chosen);
+  const models = (prof && prof.models) || [];
+  const sel = $('aiscanmodel');
+  sel.innerHTML = '<option value="">Profile default' + (prof ? ' (' + esc(prof.model) + ')' : '') + '</option>' +
+    models.filter(m => !prof || m !== prof.model).map(m => '<option value="' + esc(m) + '">' + esc(m) + '</option>').join('');
+  const saved = prof && lsGet('ctiScanModel:' + prof.name);
+  sel.value = saved && models.includes(saved) ? saved : '';
+  sel.disabled = $('scanmode').value !== 'ai' || models.length < 2;
+}
 function updateAiHint() {
+  syncScanModels();
   const sel = $('aiprofile');
   const mode = $('scanmode').value;
   const chosen = sel.value || aiDefault;
@@ -2046,8 +2064,11 @@ function scanSelected() {
     if (!prof) { setWsMsg('AI scan blocked: pick a model or set a default', true); return; }
     if (!prof.ready) { setWsMsg('AI scan blocked: ' + prof.name + ' not ready — ' + (prof.reason || 'missing key (export + restart)'), true); return; }
   }
-  setWsMsg('Scanning ' + currentOrg + ' (' + mode + (ai_profile ? ', ' + ai_profile : '') + ')…');
-  const payload = ai_profile ? { mode, ai_profile } : { mode };
+  const model = mode === 'ai' ? ($('aiscanmodel').value || '') : '';
+  setWsMsg('Scanning ' + currentOrg + ' (' + mode + (ai_profile ? ', ' + ai_profile : '') + (model ? ', ' + model : '') + ')…');
+  const payload = { mode };
+  if (ai_profile) payload.ai_profile = ai_profile;
+  if (model) payload.model = model;
   fetch('/api/orgs/' + encodeURIComponent(currentOrg) + '/scan', {
     method: 'POST',
     headers: authHeaders(),
@@ -2056,6 +2077,7 @@ function scanSelected() {
     if (!ok) { setWsMsg('Scan failed: ' + (body.error || 'error'), true); loadLogs(); return; }
     let msg = 'Scan queued for ' + (body.slug || currentOrg) + ' [' + (body.mode || mode) + ']';
     if (body.ai_profile) msg += ' · profile: ' + body.ai_profile;
+    if (body.model) msg += ' · model: ' + body.model;
     if (body.ai) msg += ' · ai: ' + body.ai;
     if (mode === 'ai') msg += ' · AI-assisted scan may take longer';
     setWsMsg(msg);

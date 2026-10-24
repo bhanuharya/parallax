@@ -996,6 +996,8 @@ def get_capabilities() -> dict:
             "label": p.get("label") or name,
             "provider": p["provider"],
             "model": p["model"] or "codex default",
+            # models a scan or the assistant may pick for this profile
+            "models": list(allowed_models(name)),
             "timeout": p["timeout"],
             "max_hosts": p["max_hosts"],
             "ready": ready,
